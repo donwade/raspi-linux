@@ -2,8 +2,8 @@
 #include "bcm270x-rpi.dtsi"
 
 / {
-	chosen: chosen {
-		bootargs = "coherent_pool=1M 8250.nr_uarts=1 snd_bcm2835.enable_headphones=0 numa_policy=interleave";
+	chosen {
+		bootargs = "coherent_pool=1M 8250.nr_uarts=1 snd_bcm2835.enable_headphones=0 cgroup_disable=memory numa_policy=interleave";
 	};
 
 	__overrides__ {

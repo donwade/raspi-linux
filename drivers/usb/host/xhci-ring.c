@@ -505,6 +505,19 @@ void xhci_ring_ep_doorbell(struct xhci_hcd *xhci,
 
 	trace_xhci_ring_ep_doorbell(slot_id, DB_VALUE(ep_index, stream_id));
 
+	/*
+	 * For non-coherent systems with PCIe DMA (such as Pi 4, Pi 5) there
+	 * is a theoretical race between the TRB write and barrier, which
+	 * is reported complete as soon as the write leaves the CPU domain,
+	 * the doorbell write, which may be reported as complete by the RC
+	 * at some arbitrary point, and the visibility of new TRBs in system
+	 * RAM by the endpoint DMA engine.
+	 *
+	 * This read before the write positively serialises the CPU state
+	 * by incurring a round-trip across the link.
+	 */
+	readl(db_addr);
+
 	writel(DB_VALUE(ep_index, stream_id), db_addr);
 	/* flush the write */
 	readl(db_addr);
@@ -1766,6 +1779,14 @@ static void handle_cmd_completion(struct xhci_hcd *xhci,
 
 	trace_xhci_handle_command(xhci->cmd_ring, &cmd_trb->generic);
 
+	cmd_comp_code = GET_COMP_CODE(le32_to_cpu(event->status));
+
+	/* If CMD ring stopped we own the trbs between enqueue and dequeue */
+	if (cmd_comp_code == COMP_COMMAND_RING_STOPPED) {
+		complete_all(&xhci->cmd_ring_stop_completion);
+		return;
+	}
+
 	cmd_dequeue_dma = xhci_trb_virt_to_dma(xhci->cmd_ring->deq_seg,
 			cmd_trb);
 	/*
@@ -1781,14 +1802,6 @@ static void handle_cmd_completion(struct xhci_hcd *xhci,
 	cmd = list_first_entry(&xhci->cmd_list, struct xhci_command, cmd_list);
 
 	cancel_delayed_work(&xhci->cmd_timer);
-
-	cmd_comp_code = GET_COMP_CODE(le32_to_cpu(event->status));
-
-	/* If CMD ring stopped we own the trbs between enqueue and dequeue */
-	if (cmd_comp_code == COMP_COMMAND_RING_STOPPED) {
-		complete_all(&xhci->cmd_ring_stop_completion);
-		return;
-	}
 
 	if (cmd->command_trb != xhci->cmd_ring->dequeue) {
 		xhci_err(xhci,
