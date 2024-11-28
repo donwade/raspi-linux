@@ -1437,6 +1437,7 @@ static int tc358743_isr(struct v4l2_subdev *sd, u32 status, bool *handled)
 {
 	u16 intstatus = i2c_rd16(sd, INTSTATUS);
 
+    //#error SUCK MY DICK
 	//dwade stop flooding 
     //v4l2_dbg(1, debug, sd, "%s: IntStatus = 0x%04x\n", __func__, intstatus);
 
@@ -2057,7 +2058,7 @@ static int tc358743_probe(struct i2c_client *client)
 	struct tc358743_platform_data *pdata = client->dev.platform_data;
 	struct v4l2_subdev *sd;
 
-    dev_warn(dev, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n");
+    dev_warn(dev, ">>>> dwade <<<<<<<<<<<\n");
 
 	u16 irq_mask = MASK_HDMI_MSK | MASK_CSI_MSK;
 	u16 chipid;
@@ -2065,7 +2066,7 @@ static int tc358743_probe(struct i2c_client *client)
 
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_BYTE_DATA))
 		return -EIO;
-	v4l_dbg(1, debug, client, "dwade1 chip found @ 0x%x (%s)\n",
+	v4l_dbg(1, debug, client, "dwade16 chip found @ 0x%x (%s)\n",
 		client->addr << 1, client->adapter->name);
 
 	imx708 = devm_kzalloc(dev, sizeof(struct tc358743_state), GFP_KERNEL);
@@ -2196,7 +2197,7 @@ static int tc358743_probe(struct i2c_client *client)
 	if (err < 0)
 		goto err_work_queues;
 
-	v4l2_info(sd, "dwade2 %s found @ 0x%x (%s)\n", client->name,
+	v4l2_info(sd, "dwade22 %s found @ 0x%x (%s)\n", client->name,
 		  client->addr << 1, client->adapter->name);
 
 	return 0;
