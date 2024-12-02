@@ -2058,7 +2058,7 @@ static int tc358743_probe(struct i2c_client *client)
 	struct tc358743_platform_data *pdata = client->dev.platform_data;
 	struct v4l2_subdev *sd;
 
-    dev_warn(dev, ">>>> dwade <<<<<<<<<<<\n");
+    dev_warn(dev, ">>>> dwade IMX708 mods +++++++++++\n");
 
 	u16 irq_mask = MASK_HDMI_MSK | MASK_CSI_MSK;
 	u16 chipid;
