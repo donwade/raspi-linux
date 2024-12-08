@@ -897,24 +897,6 @@ static inline void get_mode_table(unsigned int code,
 	}
 }
 
-/* Write registers up to 2 at a time */
-static int imx911_write_reg(struct imx911 *imx911, u16 reg, u32 len, u32 val)
-{
-#if 0
-	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
-	u8 buf[6];
-
-	if (len > 4)
-		return -EINVAL;
-
-	put_unaligned_be16(reg, buf);
-	put_unaligned_be32(val << (8 * (4 - len)), buf + 2);
-	if (i2c_master_send(client, buf, len + 2) != len + 2)
-		return -EIO;
-#endif
-	return 0;
-}
-
 /* Get bayer order based on flip setting. */
 static u32 imx911_get_format_code(struct imx911 *imx911)
 {
@@ -992,6 +974,7 @@ static int imx911_set_exposure(struct imx911 *imx911, unsigned int val)
 	val = max(val, imx911->mode->exposure_lines_min);
 	val -= val % imx911->mode->exposure_lines_step;
 
+#if 0
 	/*
 	 * In HDR mode this will set the longest exposure. The sensor
 	 * will automatically divide the medium and short ones by 4,16.
@@ -999,6 +982,8 @@ static int imx911_set_exposure(struct imx911 *imx911, unsigned int val)
 	return imx911_write_reg(imx911, IMX708_REG_EXPOSURE,
 				IMX708_REG_VALUE_16BIT,
 				val >> imx911->long_exp_shift);
+#endif
+    return 0;
 }
 
 static void imx911_adjust_exposure_range(struct imx911 *imx911,
@@ -1017,21 +1002,23 @@ static void imx911_adjust_exposure_range(struct imx911 *imx911,
 
 static int imx911_set_analogue_gain(struct imx911 *imx911, unsigned int val)
 {
-	int ret;
 
 	/*
 	 * In HDR mode this will set the gain for the longest exposure,
 	 * and by default the sensor uses the same gain for all of them.
 	 */
+#if 0
+	int ret;
 	ret = imx911_write_reg(imx911, IMX708_REG_ANALOG_GAIN,
 			       IMX708_REG_VALUE_16BIT, val);
 
 	return ret;
+#endif
+    return 0;
 }
 
 static int imx911_set_frame_length(struct imx911 *imx911, unsigned int val)
 {
-	int ret;
 
 	imx911->long_exp_shift = 0;
 
@@ -1039,7 +1026,8 @@ static int imx911_set_frame_length(struct imx911 *imx911, unsigned int val)
 		imx911->long_exp_shift++;
 		val >>= 1;
 	}
-
+#if 0
+	int ret;
 	ret = imx911_write_reg(imx911, IMX708_REG_FRAME_LENGTH,
 			       IMX708_REG_VALUE_16BIT, val);
 	if (ret)
@@ -1047,6 +1035,8 @@ static int imx911_set_frame_length(struct imx911 *imx911, unsigned int val)
 
 	return imx911_write_reg(imx911, IMX708_LONG_EXP_SHIFT_REG,
 				IMX708_REG_VALUE_08BIT, imx911->long_exp_shift);
+#endif
+    return 0;
 }
 
 static void imx911_set_framing_limits(struct imx911 *imx911)
@@ -1106,13 +1096,7 @@ static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 	}
 
-	/*
-	 * Applying V4L2 control value only happens
-	 * when power is up for streaming
-	 */
-	if (pm_runtime_get_if_in_use(&client->dev) == 0)
-		return 0;
-
+    ret = 0;
 	switch (ctrl->id) {
 	case V4L2_CID_ANALOGUE_GAIN:
 		imx911_set_analogue_gain(imx911, ctrl->val);
@@ -1121,49 +1105,20 @@ static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
 		ret = imx911_set_exposure(imx911, ctrl->val);
 		break;
 	case V4L2_CID_DIGITAL_GAIN:
-		ret = imx911_write_reg(imx911, IMX708_REG_DIGITAL_GAIN,
-				       IMX708_REG_VALUE_16BIT, ctrl->val);
-		break;
 	case V4L2_CID_TEST_PATTERN:
-		ret = imx911_write_reg(imx911, IMX708_REG_TEST_PATTERN,
-				       IMX708_REG_VALUE_16BIT,
-				       imx911_test_pattern_val[ctrl->val]);
-		break;
 	case V4L2_CID_TEST_PATTERN_RED:
-		ret = imx911_write_reg(imx911, IMX708_REG_TEST_PATTERN_R,
-				       IMX708_REG_VALUE_16BIT, ctrl->val);
-		break;
 	case V4L2_CID_TEST_PATTERN_GREENR:
-		ret = imx911_write_reg(imx911, IMX708_REG_TEST_PATTERN_GR,
-				       IMX708_REG_VALUE_16BIT, ctrl->val);
-		break;
 	case V4L2_CID_TEST_PATTERN_BLUE:
-		ret = imx911_write_reg(imx911, IMX708_REG_TEST_PATTERN_B,
-				       IMX708_REG_VALUE_16BIT, ctrl->val);
-		break;
 	case V4L2_CID_TEST_PATTERN_GREENB:
-		ret = imx911_write_reg(imx911, IMX708_REG_TEST_PATTERN_GB,
-				       IMX708_REG_VALUE_16BIT, ctrl->val);
-		break;
 	case V4L2_CID_HFLIP:
 	case V4L2_CID_VFLIP:
-		ret = imx911_write_reg(imx911, IMX708_REG_ORIENTATION, 1,
-				       imx911->hflip->val |
-				       imx911->vflip->val << 1);
-		break;
+        break;
+
 	case V4L2_CID_VBLANK:
 		ret = imx911_set_frame_length(imx911,
 					      imx911->mode->height + ctrl->val);
 		break;
 	case V4L2_CID_NOTIFY_GAINS:
-		ret = imx911_write_reg(imx911, IMX708_REG_COLOUR_BALANCE_BLUE,
-				       IMX708_REG_VALUE_16BIT,
-				       ctrl->p_new.p_u32[0]);
-		if (ret)
-			break;
-		ret = imx911_write_reg(imx911, IMX708_REG_COLOUR_BALANCE_RED,
-				       IMX708_REG_VALUE_16BIT,
-				       ctrl->p_new.p_u32[3]);
 		break;
 	case V4L2_CID_WIDE_DYNAMIC_RANGE:
 		/* Already handled above. */
@@ -1175,8 +1130,6 @@ static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
 		ret = -EINVAL;
 		break;
 	}
-
-	pm_runtime_put(&client->dev);
 
 	return ret;
 }
