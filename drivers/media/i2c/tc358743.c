@@ -1,3 +1,2119 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * A V4L2 driver for Sony IMX708 cameras.
+ * Copyright (C) 2022, Raspberry Pi Ltd
+ *
+ * Based on Sony imx477 camera driver
+ * Copyright (C) 2020 Raspberry Pi Ltd
+ */
+#include <asm/unaligned.h>
+#include <linux/clk.h>
+#include <linux/delay.h>
+#include <linux/gpio/consumer.h>
+#include <linux/i2c.h>
+#include <linux/module.h>
+#include <linux/pm_runtime.h>
+#include <linux/regulator/consumer.h>
+#include <media/v4l2-ctrls.h>
+#include <media/v4l2-device.h>
+#include <media/v4l2-event.h>
+#include <media/v4l2-fwnode.h>
+#include <media/v4l2-mediabus.h>
+
+/*
+ * Parameter to adjust Quad Bayer re-mosaic broken line correction
+ * strength, used in full-resolution mode only. Set zero to disable.
+ */
+static int qbc_adjust = 2;
+module_param(qbc_adjust, int, 0644);
+MODULE_PARM_DESC(qbc_adjust, "Quad Bayer broken line correction strength [0,2-5]");
+
+#define IMX708_REG_VALUE_08BIT		1
+#define IMX708_REG_VALUE_16BIT		2
+
+/* Chip ID */
+#define IMX708_REG_CHIP_ID		0x0016
+#define IMX708_CHIP_ID			0x0708
+
+#define IMX708_REG_MODE_SELECT		0x0100
+#define IMX708_MODE_STANDBY		0x00
+#define IMX708_MODE_STREAMING		0x01
+
+#define IMX708_REG_ORIENTATION		0x101
+
+#define IMX708_INCLK_FREQ		24000000
+
+/* Default initial pixel rate, will get updated for each mode. */
+#define IMX708_INITIAL_PIXEL_RATE	590000000
+
+/* V_TIMING internal */
+#define IMX708_REG_FRAME_LENGTH		0x0340
+#define IMX708_FRAME_LENGTH_MAX		0xffff
+
+/* Long exposure multiplier */
+#define IMX708_LONG_EXP_SHIFT_MAX	7
+#define IMX708_LONG_EXP_SHIFT_REG	0x3100
+
+/* Exposure control */
+#define IMX708_REG_EXPOSURE		0x0202
+#define IMX708_EXPOSURE_OFFSET		48
+#define IMX708_EXPOSURE_DEFAULT		0x640
+#define IMX708_EXPOSURE_STEP		1
+#define IMX708_EXPOSURE_MIN		1
+#define IMX708_EXPOSURE_MAX		(IMX708_FRAME_LENGTH_MAX - \
+					 IMX708_EXPOSURE_OFFSET)
+
+/* Analog gain control */
+#define IMX708_REG_ANALOG_GAIN		0x0204
+#define IMX708_ANA_GAIN_MIN		112
+#define IMX708_ANA_GAIN_MAX		960
+#define IMX708_ANA_GAIN_STEP		1
+#define IMX708_ANA_GAIN_DEFAULT	   IMX708_ANA_GAIN_MIN
+
+/* Digital gain control */
+#define IMX708_REG_DIGITAL_GAIN		0x020e
+#define IMX708_DGTL_GAIN_MIN		0x0100
+#define IMX708_DGTL_GAIN_MAX		0xffff
+#define IMX708_DGTL_GAIN_DEFAULT	0x0100
+#define IMX708_DGTL_GAIN_STEP		1
+
+/* Colour balance controls */
+#define IMX708_REG_COLOUR_BALANCE_RED   0x0b90
+#define IMX708_REG_COLOUR_BALANCE_BLUE	0x0b92
+#define IMX708_COLOUR_BALANCE_MIN	0x01
+#define IMX708_COLOUR_BALANCE_MAX	0xffff
+#define IMX708_COLOUR_BALANCE_STEP	0x01
+#define IMX708_COLOUR_BALANCE_DEFAULT	0x100
+
+/* Test Pattern Control */
+#define IMX708_REG_TEST_PATTERN		0x0600
+#define IMX708_TEST_PATTERN_DISABLE	0
+#define IMX708_TEST_PATTERN_SOLID_COLOR	1
+#define IMX708_TEST_PATTERN_COLOR_BARS	2
+#define IMX708_TEST_PATTERN_GREY_COLOR	3
+#define IMX708_TEST_PATTERN_PN9		4
+
+/* Test pattern colour components */
+#define IMX708_REG_TEST_PATTERN_R	0x0602
+#define IMX708_REG_TEST_PATTERN_GR	0x0604
+#define IMX708_REG_TEST_PATTERN_B	0x0606
+#define IMX708_REG_TEST_PATTERN_GB	0x0608
+#define IMX708_TEST_PATTERN_COLOUR_MIN	0
+#define IMX708_TEST_PATTERN_COLOUR_MAX	0x0fff
+#define IMX708_TEST_PATTERN_COLOUR_STEP	1
+
+#define IMX708_REG_BASE_SPC_GAINS_L	0x7b10
+#define IMX708_REG_BASE_SPC_GAINS_R	0x7c00
+
+/* HDR exposure ratio (long:med == med:short) */
+#define IMX708_HDR_EXPOSURE_RATIO       4
+#define IMX708_REG_MID_EXPOSURE		0x3116
+#define IMX708_REG_SHT_EXPOSURE		0x0224
+#define IMX708_REG_MID_ANALOG_GAIN	0x3118
+#define IMX708_REG_SHT_ANALOG_GAIN	0x0216
+
+/* QBC Re-mosaic broken line correction registers */
+#define IMX708_LPF_INTENSITY_EN		0xC428
+#define IMX708_LPF_INTENSITY_ENABLED	0x00
+#define IMX708_LPF_INTENSITY_DISABLED	0x01
+#define IMX708_LPF_INTENSITY		0xC429
+
+/*
+ * Metadata buffer holds a variety of data, all sent with the same VC/DT (0x12).
+ * It comprises two scanlines (of up to 5760 bytes each, for 4608 pixels)
+ * of embedded data, one line of PDAF data, and two lines of AE-HIST data
+ * (AE histograms are valid for HDR mode and empty in non-HDR modes).
+ */
+#define IMX708_EMBEDDED_LINE_WIDTH (5 * 5760)
+#define IMX708_NUM_EMBEDDED_LINES 1
+
+enum pad_types {
+	IMAGE_PAD,
+	METADATA_PAD,
+	NUM_PADS
+};
+
+/* IMX708 native and active pixel array size. */
+#define IMX708_NATIVE_WIDTH		4640U
+#define IMX708_NATIVE_HEIGHT		2658U
+#define IMX708_PIXEL_ARRAY_LEFT		16U
+#define IMX708_PIXEL_ARRAY_TOP		24U
+#define IMX708_PIXEL_ARRAY_WIDTH	4608U
+#define IMX708_PIXEL_ARRAY_HEIGHT	2592U
+
+struct imx911_reg {
+	u16 address;
+	u8 val;
+};
+
+struct imx911_reg_list {
+	unsigned int num_of_regs;
+	const struct imx911_reg *regs;
+};
+
+/* Mode : resolution and related config&values */
+struct imx911_mode {
+	/* Frame width */
+	unsigned int width;
+
+	/* Frame height */
+	unsigned int height;
+
+	/* H-timing in pixels */
+	unsigned int line_length_pix;
+
+	/* Analog crop rectangle. */
+	struct v4l2_rect crop;
+
+	/* Highest possible framerate. */
+	unsigned int vblank_min;
+
+	/* Default framerate. */
+	unsigned int vblank_default;
+
+	/* Default register values */
+	struct imx911_reg_list reg_list;
+
+	/* Not all modes have the same pixel rate. */
+	u64 pixel_rate;
+
+	/* Not all modes have the same minimum exposure. */
+	u32 exposure_lines_min;
+
+	/* Not all modes have the same exposure lines step. */
+	u32 exposure_lines_step;
+
+	/* HDR flag, used for checking if the current mode is HDR */
+	bool hdr;
+
+	/* Quad Bayer Re-mosaic flag */
+	bool remosaic;
+};
+
+/* Default PDAF pixel correction gains */
+static const u8 pdaf_gains[2][9] = {
+	{ 0x4c, 0x4c, 0x4c, 0x46, 0x3e, 0x38, 0x35, 0x35, 0x35 },
+	{ 0x35, 0x35, 0x35, 0x38, 0x3e, 0x46, 0x4c, 0x4c, 0x4c }
+};
+
+/* Link frequency setup */
+enum {
+	IMX708_LINK_FREQ_450MHZ,
+	IMX708_LINK_FREQ_447MHZ,
+	IMX708_LINK_FREQ_453MHZ,
+};
+
+static const s64 link_freqs[] = {
+	[IMX708_LINK_FREQ_450MHZ] = 450000000,
+	[IMX708_LINK_FREQ_447MHZ] = 447000000,
+	[IMX708_LINK_FREQ_453MHZ] = 453000000,
+};
+
+/* 450MHz is the nominal "default" link frequency */
+static const struct imx911_reg link_450Mhz_regs[] = {
+	{0x030E, 0x01},
+	{0x030F, 0x2c},
+};
+
+static const struct imx911_reg link_447Mhz_regs[] = {
+	{0x030E, 0x01},
+	{0x030F, 0x2a},
+};
+
+static const struct imx911_reg link_453Mhz_regs[] = {
+	{0x030E, 0x01},
+	{0x030F, 0x2e},
+};
+
+static const struct imx911_reg_list link_freq_regs[] = {
+	[IMX708_LINK_FREQ_450MHZ] = {
+		.regs = link_450Mhz_regs,
+		.num_of_regs = ARRAY_SIZE(link_450Mhz_regs)
+	},
+	[IMX708_LINK_FREQ_447MHZ] = {
+		.regs = link_447Mhz_regs,
+		.num_of_regs = ARRAY_SIZE(link_447Mhz_regs)
+	},
+	[IMX708_LINK_FREQ_453MHZ] = {
+		.regs = link_453Mhz_regs,
+		.num_of_regs = ARRAY_SIZE(link_453Mhz_regs)
+	},
+};
+
+static const struct imx911_reg mode_common_regs[] = {
+	{0x0100, 0x00},
+	{0x0136, 0x18},
+	{0x0137, 0x00},
+	{0x33F0, 0x02},
+	{0x33F1, 0x05},
+	{0x3062, 0x00},
+	{0x3063, 0x12},
+	{0x3068, 0x00},
+	{0x3069, 0x12},
+	{0x306A, 0x00},
+	{0x306B, 0x30},
+	{0x3076, 0x00},
+	{0x3077, 0x30},
+	{0x3078, 0x00},
+	{0x3079, 0x30},
+	{0x5E54, 0x0C},
+	{0x6E44, 0x00},
+	{0xB0B6, 0x01},
+	{0xE829, 0x00},
+	{0xF001, 0x08},
+	{0xF003, 0x08},
+	{0xF00D, 0x10},
+	{0xF00F, 0x10},
+	{0xF031, 0x08},
+	{0xF033, 0x08},
+	{0xF03D, 0x10},
+	{0xF03F, 0x10},
+	{0x0112, 0x0A},
+	{0x0113, 0x0A},
+	{0x0114, 0x01},
+	{0x0B8E, 0x01},
+	{0x0B8F, 0x00},
+	{0x0B94, 0x01},
+	{0x0B95, 0x00},
+	{0x3400, 0x01},
+	{0x3478, 0x01},
+	{0x3479, 0x1c},
+	{0x3091, 0x01},
+	{0x3092, 0x00},
+	{0x3419, 0x00},
+	{0xBCF1, 0x02},
+	{0x3094, 0x01},
+	{0x3095, 0x01},
+	{0x3362, 0x00},
+	{0x3363, 0x00},
+	{0x3364, 0x00},
+	{0x3365, 0x00},
+	{0x0138, 0x01},
+};
+
+/* 10-bit. */
+static const struct imx911_reg mode_4608x2592_regs[] = {
+	{0x0342, 0x3D},
+	{0x0343, 0x20},
+	{0x0340, 0x0A},
+	{0x0341, 0x59},
+	{0x0344, 0x00},
+	{0x0345, 0x00},
+	{0x0346, 0x00},
+	{0x0347, 0x00},
+	{0x0348, 0x11},
+	{0x0349, 0xFF},
+	{0x034A, 0X0A},
+	{0x034B, 0x1F},
+	{0x0220, 0x62},
+	{0x0222, 0x01},
+	{0x0900, 0x00},
+	{0x0901, 0x11},
+	{0x0902, 0x0A},
+	{0x3200, 0x01},
+	{0x3201, 0x01},
+	{0x32D5, 0x01},
+	{0x32D6, 0x00},
+	{0x32DB, 0x01},
+	{0x32DF, 0x00},
+	{0x350C, 0x00},
+	{0x350D, 0x00},
+	{0x0408, 0x00},
+	{0x0409, 0x00},
+	{0x040A, 0x00},
+	{0x040B, 0x00},
+	{0x040C, 0x12},
+	{0x040D, 0x00},
+	{0x040E, 0x0A},
+	{0x040F, 0x20},
+	{0x034C, 0x12},
+	{0x034D, 0x00},
+	{0x034E, 0x0A},
+	{0x034F, 0x20},
+	{0x0301, 0x05},
+	{0x0303, 0x02},
+	{0x0305, 0x02},
+	{0x0306, 0x00},
+	{0x0307, 0x7C},
+	{0x030B, 0x02},
+	{0x030D, 0x04},
+	{0x0310, 0x01},
+	{0x3CA0, 0x00},
+	{0x3CA1, 0x64},
+	{0x3CA4, 0x00},
+	{0x3CA5, 0x00},
+	{0x3CA6, 0x00},
+	{0x3CA7, 0x00},
+	{0x3CAA, 0x00},
+	{0x3CAB, 0x00},
+	{0x3CB8, 0x00},
+	{0x3CB9, 0x08},
+	{0x3CBA, 0x00},
+	{0x3CBB, 0x00},
+	{0x3CBC, 0x00},
+	{0x3CBD, 0x3C},
+	{0x3CBE, 0x00},
+	{0x3CBF, 0x00},
+	{0x0202, 0x0A},
+	{0x0203, 0x29},
+	{0x0224, 0x01},
+	{0x0225, 0xF4},
+	{0x3116, 0x01},
+	{0x3117, 0xF4},
+	{0x0204, 0x00},
+	{0x0205, 0x00},
+	{0x0216, 0x00},
+	{0x0217, 0x00},
+	{0x0218, 0x01},
+	{0x0219, 0x00},
+	{0x020E, 0x01},
+	{0x020F, 0x00},
+	{0x3118, 0x00},
+	{0x3119, 0x00},
+	{0x311A, 0x01},
+	{0x311B, 0x00},
+	{0x341a, 0x00},
+	{0x341b, 0x00},
+	{0x341c, 0x00},
+	{0x341d, 0x00},
+	{0x341e, 0x01},
+	{0x341f, 0x20},
+	{0x3420, 0x00},
+	{0x3421, 0xd8},
+	{0x3366, 0x00},
+	{0x3367, 0x00},
+	{0x3368, 0x00},
+	{0x3369, 0x00},
+};
+
+static const struct imx911_reg mode_2x2binned_regs[] = {
+	{0x0342, 0x1E},
+	{0x0343, 0x90},
+	{0x0340, 0x05},
+	{0x0341, 0x38},
+	{0x0344, 0x00},
+	{0x0345, 0x00},
+	{0x0346, 0x00},
+	{0x0347, 0x00},
+	{0x0348, 0x11},
+	{0x0349, 0xFF},
+	{0x034A, 0X0A},
+	{0x034B, 0x1F},
+	{0x0220, 0x62},
+	{0x0222, 0x01},
+	{0x0900, 0x01},
+	{0x0901, 0x22},
+	{0x0902, 0x08},
+	{0x3200, 0x41},
+	{0x3201, 0x41},
+	{0x32D5, 0x00},
+	{0x32D6, 0x00},
+	{0x32DB, 0x01},
+	{0x32DF, 0x00},
+	{0x350C, 0x00},
+	{0x350D, 0x00},
+	{0x0408, 0x00},
+	{0x0409, 0x00},
+	{0x040A, 0x00},
+	{0x040B, 0x00},
+	{0x040C, 0x09},
+	{0x040D, 0x00},
+	{0x040E, 0x05},
+	{0x040F, 0x10},
+	{0x034C, 0x09},
+	{0x034D, 0x00},
+	{0x034E, 0x05},
+	{0x034F, 0x10},
+	{0x0301, 0x05},
+	{0x0303, 0x02},
+	{0x0305, 0x02},
+	{0x0306, 0x00},
+	{0x0307, 0x7A},
+	{0x030B, 0x02},
+	{0x030D, 0x04},
+	{0x0310, 0x01},
+	{0x3CA0, 0x00},
+	{0x3CA1, 0x3C},
+	{0x3CA4, 0x00},
+	{0x3CA5, 0x3C},
+	{0x3CA6, 0x00},
+	{0x3CA7, 0x00},
+	{0x3CAA, 0x00},
+	{0x3CAB, 0x00},
+	{0x3CB8, 0x00},
+	{0x3CB9, 0x1C},
+	{0x3CBA, 0x00},
+	{0x3CBB, 0x08},
+	{0x3CBC, 0x00},
+	{0x3CBD, 0x1E},
+	{0x3CBE, 0x00},
+	{0x3CBF, 0x0A},
+	{0x0202, 0x05},
+	{0x0203, 0x08},
+	{0x0224, 0x01},
+	{0x0225, 0xF4},
+	{0x3116, 0x01},
+	{0x3117, 0xF4},
+	{0x0204, 0x00},
+	{0x0205, 0x70},
+	{0x0216, 0x00},
+	{0x0217, 0x70},
+	{0x0218, 0x01},
+	{0x0219, 0x00},
+	{0x020E, 0x01},
+	{0x020F, 0x00},
+	{0x3118, 0x00},
+	{0x3119, 0x70},
+	{0x311A, 0x01},
+	{0x311B, 0x00},
+	{0x341a, 0x00},
+	{0x341b, 0x00},
+	{0x341c, 0x00},
+	{0x341d, 0x00},
+	{0x341e, 0x00},
+	{0x341f, 0x90},
+	{0x3420, 0x00},
+	{0x3421, 0x6c},
+	{0x3366, 0x00},
+	{0x3367, 0x00},
+	{0x3368, 0x00},
+	{0x3369, 0x00},
+};
+
+static const struct imx911_reg mode_2x2binned_720p_regs[] = {
+	{0x0342, 0x14},
+	{0x0343, 0x60},
+	{0x0340, 0x04},
+	{0x0341, 0xB6},
+	{0x0344, 0x03},
+	{0x0345, 0x00},
+	{0x0346, 0x01},
+	{0x0347, 0xB0},
+	{0x0348, 0x0E},
+	{0x0349, 0xFF},
+	{0x034A, 0x08},
+	{0x034B, 0x6F},
+	{0x0220, 0x62},
+	{0x0222, 0x01},
+	{0x0900, 0x01},
+	{0x0901, 0x22},
+	{0x0902, 0x08},
+	{0x3200, 0x41},
+	{0x3201, 0x41},
+	{0x32D5, 0x00},
+	{0x32D6, 0x00},
+	{0x32DB, 0x01},
+	{0x32DF, 0x01},
+	{0x350C, 0x00},
+	{0x350D, 0x00},
+	{0x0408, 0x00},
+	{0x0409, 0x00},
+	{0x040A, 0x00},
+	{0x040B, 0x00},
+	{0x040C, 0x06},
+	{0x040D, 0x00},
+	{0x040E, 0x03},
+	{0x040F, 0x60},
+	{0x034C, 0x06},
+	{0x034D, 0x00},
+	{0x034E, 0x03},
+	{0x034F, 0x60},
+	{0x0301, 0x05},
+	{0x0303, 0x02},
+	{0x0305, 0x02},
+	{0x0306, 0x00},
+	{0x0307, 0x76},
+	{0x030B, 0x02},
+	{0x030D, 0x04},
+	{0x0310, 0x01},
+	{0x3CA0, 0x00},
+	{0x3CA1, 0x3C},
+	{0x3CA4, 0x01},
+	{0x3CA5, 0x5E},
+	{0x3CA6, 0x00},
+	{0x3CA7, 0x00},
+	{0x3CAA, 0x00},
+	{0x3CAB, 0x00},
+	{0x3CB8, 0x00},
+	{0x3CB9, 0x0C},
+	{0x3CBA, 0x00},
+	{0x3CBB, 0x04},
+	{0x3CBC, 0x00},
+	{0x3CBD, 0x1E},
+	{0x3CBE, 0x00},
+	{0x3CBF, 0x05},
+	{0x0202, 0x04},
+	{0x0203, 0x86},
+	{0x0224, 0x01},
+	{0x0225, 0xF4},
+	{0x3116, 0x01},
+	{0x3117, 0xF4},
+	{0x0204, 0x00},
+	{0x0205, 0x70},
+	{0x0216, 0x00},
+	{0x0217, 0x70},
+	{0x0218, 0x01},
+	{0x0219, 0x00},
+	{0x020E, 0x01},
+	{0x020F, 0x00},
+	{0x3118, 0x00},
+	{0x3119, 0x70},
+	{0x311A, 0x01},
+	{0x311B, 0x00},
+	{0x341a, 0x00},
+	{0x341b, 0x00},
+	{0x341c, 0x00},
+	{0x341d, 0x00},
+	{0x341e, 0x00},
+	{0x341f, 0x60},
+	{0x3420, 0x00},
+	{0x3421, 0x48},
+	{0x3366, 0x00},
+	{0x3367, 0x00},
+	{0x3368, 0x00},
+	{0x3369, 0x00},
+};
+
+static const struct imx911_reg mode_hdr_regs[] = {
+	{0x0342, 0x14},
+	{0x0343, 0x60},
+	{0x0340, 0x0A},
+	{0x0341, 0x5B},
+	{0x0344, 0x00},
+	{0x0345, 0x00},
+	{0x0346, 0x00},
+	{0x0347, 0x00},
+	{0x0348, 0x11},
+	{0x0349, 0xFF},
+	{0x034A, 0X0A},
+	{0x034B, 0x1F},
+	{0x0220, 0x01},
+	{0x0222, IMX708_HDR_EXPOSURE_RATIO},
+	{0x0900, 0x00},
+	{0x0901, 0x11},
+	{0x0902, 0x0A},
+	{0x3200, 0x01},
+	{0x3201, 0x01},
+	{0x32D5, 0x00},
+	{0x32D6, 0x00},
+	{0x32DB, 0x01},
+	{0x32DF, 0x00},
+	{0x350C, 0x00},
+	{0x350D, 0x00},
+	{0x0408, 0x00},
+	{0x0409, 0x00},
+	{0x040A, 0x00},
+	{0x040B, 0x00},
+	{0x040C, 0x09},
+	{0x040D, 0x00},
+	{0x040E, 0x05},
+	{0x040F, 0x10},
+	{0x034C, 0x09},
+	{0x034D, 0x00},
+	{0x034E, 0x05},
+	{0x034F, 0x10},
+	{0x0301, 0x05},
+	{0x0303, 0x02},
+	{0x0305, 0x02},
+	{0x0306, 0x00},
+	{0x0307, 0xA2},
+	{0x030B, 0x02},
+	{0x030D, 0x04},
+	{0x0310, 0x01},
+	{0x3CA0, 0x00},
+	{0x3CA1, 0x00},
+	{0x3CA4, 0x00},
+	{0x3CA5, 0x00},
+	{0x3CA6, 0x00},
+	{0x3CA7, 0x28},
+	{0x3CAA, 0x00},
+	{0x3CAB, 0x00},
+	{0x3CB8, 0x00},
+	{0x3CB9, 0x30},
+	{0x3CBA, 0x00},
+	{0x3CBB, 0x00},
+	{0x3CBC, 0x00},
+	{0x3CBD, 0x32},
+	{0x3CBE, 0x00},
+	{0x3CBF, 0x00},
+	{0x0202, 0x0A},
+	{0x0203, 0x2B},
+	{0x0224, 0x0A},
+	{0x0225, 0x2B},
+	{0x3116, 0x0A},
+	{0x3117, 0x2B},
+	{0x0204, 0x00},
+	{0x0205, 0x00},
+	{0x0216, 0x00},
+	{0x0217, 0x00},
+	{0x0218, 0x01},
+	{0x0219, 0x00},
+	{0x020E, 0x01},
+	{0x020F, 0x00},
+	{0x3118, 0x00},
+	{0x3119, 0x00},
+	{0x311A, 0x01},
+	{0x311B, 0x00},
+	{0x341a, 0x00},
+	{0x341b, 0x00},
+	{0x341c, 0x00},
+	{0x341d, 0x00},
+	{0x341e, 0x00},
+	{0x341f, 0x90},
+	{0x3420, 0x00},
+	{0x3421, 0x6c},
+	{0x3360, 0x01},
+	{0x3361, 0x01},
+	{0x3366, 0x09},
+	{0x3367, 0x00},
+	{0x3368, 0x05},
+	{0x3369, 0x10},
+};
+
+/* Mode configs. Keep separate lists for when HDR is enabled or not. */
+static const struct imx911_mode supported_modes_10bit_no_hdr[] = {
+	{
+		/* Full resolution. */
+		.width = 4608,
+		.height = 2592,
+		.line_length_pix = 0x3d20,
+		.crop = {
+			.left = IMX708_PIXEL_ARRAY_LEFT,
+			.top = IMX708_PIXEL_ARRAY_TOP,
+			.width = 4608,
+			.height = 2592,
+		},
+		.vblank_min = 58,
+		.vblank_default = 58,
+		.reg_list = {
+			.num_of_regs = ARRAY_SIZE(mode_4608x2592_regs),
+			.regs = mode_4608x2592_regs,
+		},
+		.pixel_rate = 595200000,
+		.exposure_lines_min = 8,
+		.exposure_lines_step = 1,
+		.hdr = false,
+		.remosaic = true
+	},
+	{
+		/* regular 2x2 binned. */
+		.width = 2304,
+		.height = 1296,
+		.line_length_pix = 0x1e90,
+		.crop = {
+			.left = IMX708_PIXEL_ARRAY_LEFT,
+			.top = IMX708_PIXEL_ARRAY_TOP,
+			.width = 4608,
+			.height = 2592,
+		},
+		.vblank_min = 40,
+		.vblank_default = 1198,
+		.reg_list = {
+			.num_of_regs = ARRAY_SIZE(mode_2x2binned_regs),
+			.regs = mode_2x2binned_regs,
+		},
+		.pixel_rate = 585600000,
+		.exposure_lines_min = 4,
+		.exposure_lines_step = 2,
+		.hdr = false,
+		.remosaic = false
+	},
+	{
+		/* 2x2 binned and cropped for 720p. */
+		.width = 1536,
+		.height = 864,
+		.line_length_pix = 0x1460,
+		.crop = {
+			.left = IMX708_PIXEL_ARRAY_LEFT + 768,
+			.top = IMX708_PIXEL_ARRAY_TOP + 432,
+			.width = 3072,
+			.height = 1728,
+		},
+		.vblank_min = 40,
+		.vblank_default = 2755,
+		.reg_list = {
+			.num_of_regs = ARRAY_SIZE(mode_2x2binned_720p_regs),
+			.regs = mode_2x2binned_720p_regs,
+		},
+		.pixel_rate = 566400000,
+		.exposure_lines_min = 4,
+		.exposure_lines_step = 2,
+		.hdr = false,
+		.remosaic = false
+	},
+};
+
+static const struct imx911_mode supported_modes_10bit_hdr[] = {
+	{
+		/* There's only one HDR mode, which is 2x2 downscaled */
+		.width = 2304,
+		.height = 1296,
+		.line_length_pix = 0x1460,
+		.crop = {
+			.left = IMX708_PIXEL_ARRAY_LEFT,
+			.top = IMX708_PIXEL_ARRAY_TOP,
+			.width = 4608,
+			.height = 2592,
+		},
+		.vblank_min = 3673,
+		.vblank_default = 3673,
+		.reg_list = {
+			.num_of_regs = ARRAY_SIZE(mode_hdr_regs),
+			.regs = mode_hdr_regs,
+		},
+		.pixel_rate = 777600000,
+		.exposure_lines_min = 8 * IMX708_HDR_EXPOSURE_RATIO * IMX708_HDR_EXPOSURE_RATIO,
+		.exposure_lines_step = 2 * IMX708_HDR_EXPOSURE_RATIO * IMX708_HDR_EXPOSURE_RATIO,
+		.hdr = true,
+		.remosaic = false
+	}
+};
+
+/*
+ * The supported formats.
+ * This table MUST contain 4 entries per format, to cover the various flip
+ * combinations in the order
+ * - no flip
+ * - h flip
+ * - v flip
+ * - h&v flips
+ */
+static const u32 codes[] = {
+	/* 10-bit modes. */
+	MEDIA_BUS_FMT_SRGGB10_1X10,
+	MEDIA_BUS_FMT_SGRBG10_1X10,
+	MEDIA_BUS_FMT_SGBRG10_1X10,
+	MEDIA_BUS_FMT_SBGGR10_1X10,
+};
+
+static const char * const imx911_test_pattern_menu[] = {
+	"Disabled",
+	"Color Bars",
+	"Solid Color",
+	"Grey Color Bars",
+	"PN9"
+};
+
+static const int imx911_test_pattern_val[] = {
+	IMX708_TEST_PATTERN_DISABLE,
+	IMX708_TEST_PATTERN_COLOR_BARS,
+	IMX708_TEST_PATTERN_SOLID_COLOR,
+	IMX708_TEST_PATTERN_GREY_COLOR,
+	IMX708_TEST_PATTERN_PN9,
+};
+
+/* regulator supplies */
+static const char * const imx911_supply_name[] = {
+	/* Supplies can be enabled in any order */
+	"vana1",  /* Analog1 (2.8V) supply */
+	"vana2",  /* Analog2 (1.8V) supply */
+	"vdig",  /* Digital Core (1.1V) supply */
+	"vddl",  /* IF (1.8V) supply */
+};
+
+/*
+ * Initialisation delay between XCLR low->high and the moment when the sensor
+ * can start capture (i.e. can leave software standby), given by T7 in the
+ * datasheet is 8ms.  This does include I2C setup time as well.
+ *
+ * Note, that delay between XCLR low->high and reading the CCI ID register (T6
+ * in the datasheet) is much smaller - 600us.
+ */
+#define IMX708_XCLR_MIN_DELAY_US	8000
+#define IMX708_XCLR_DELAY_RANGE_US	1000
+
+struct imx911 {
+	struct v4l2_subdev sd;
+	struct media_pad pad[NUM_PADS];
+
+	struct v4l2_mbus_framefmt fmt;
+
+	struct clk *inclk;
+	u32 inclk_freq;
+
+	struct gpio_desc *reset_gpio;
+	struct regulator_bulk_data supplies[ARRAY_SIZE(imx911_supply_name)];
+
+	struct v4l2_ctrl_handler ctrl_handler;
+	/* V4L2 Controls */
+	struct v4l2_ctrl *pixel_rate;
+	struct v4l2_ctrl *exposure;
+	struct v4l2_ctrl *vblank;
+	struct v4l2_ctrl *hblank;
+	struct v4l2_ctrl *hdr_mode;
+	struct v4l2_ctrl *link_freq;
+	struct {
+		struct v4l2_ctrl *hflip;
+		struct v4l2_ctrl *vflip;
+	};
+
+	/* Current mode */
+	const struct imx911_mode *mode;
+
+	/*
+	 * Mutex for serialized access:
+	 * Protect sensor module set pad format and start/stop streaming safely.
+	 */
+	struct mutex mutex;
+
+	/* Streaming on/off */
+	bool streaming;
+
+	/* Rewrite common registers on stream on? */
+	bool common_regs_written;
+
+	/* Current long exposure factor in use. Set through V4L2_CID_VBLANK */
+	unsigned int long_exp_shift;
+
+	unsigned int link_freq_idx;
+};
+
+static inline struct imx911 *to_imx911(struct v4l2_subdev *_sd)
+{
+	return container_of(_sd, struct imx911, sd);
+}
+
+static inline void get_mode_table(unsigned int code,
+				  const struct imx911_mode **mode_list,
+				  unsigned int *num_modes,
+				  bool hdr_enable)
+{
+	switch (code) {
+	/* 10-bit */
+	case MEDIA_BUS_FMT_SRGGB10_1X10:
+	case MEDIA_BUS_FMT_SGRBG10_1X10:
+	case MEDIA_BUS_FMT_SGBRG10_1X10:
+	case MEDIA_BUS_FMT_SBGGR10_1X10:
+		if (hdr_enable) {
+			*mode_list = supported_modes_10bit_hdr;
+			*num_modes = ARRAY_SIZE(supported_modes_10bit_hdr);
+		} else {
+			*mode_list = supported_modes_10bit_no_hdr;
+			*num_modes = ARRAY_SIZE(supported_modes_10bit_no_hdr);
+		}
+		break;
+	default:
+		*mode_list = NULL;
+		*num_modes = 0;
+	}
+}
+
+/* Read registers up to 2 at a time */
+static int imx911_read_reg(struct imx911 *imx911, u16 reg, u32 len, u32 *val)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
+	struct i2c_msg msgs[2];
+	u8 addr_buf[2] = { reg >> 8, reg & 0xff };
+	u8 data_buf[4] = { 0, };
+	int ret;
+
+	if (len > 4)
+		return -EINVAL;
+
+	/* Write register address */
+	msgs[0].addr = client->addr;
+	msgs[0].flags = 0;
+	msgs[0].len = ARRAY_SIZE(addr_buf);
+	msgs[0].buf = addr_buf;
+
+	/* Read data from register */
+	msgs[1].addr = client->addr;
+	msgs[1].flags = I2C_M_RD;
+	msgs[1].len = len;
+	msgs[1].buf = &data_buf[4 - len];
+
+	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
+	if (ret != ARRAY_SIZE(msgs))
+		return -EIO;
+
+	*val = get_unaligned_be32(data_buf);
+
+	return 0;
+}
+
+/* Write registers up to 2 at a time */
+static int imx911_write_reg(struct imx911 *imx911, u16 reg, u32 len, u32 val)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
+	u8 buf[6];
+
+	if (len > 4)
+		return -EINVAL;
+
+	put_unaligned_be16(reg, buf);
+	put_unaligned_be32(val << (8 * (4 - len)), buf + 2);
+	if (i2c_master_send(client, buf, len + 2) != len + 2)
+		return -EIO;
+
+	return 0;
+}
+
+/* Write a list of registers */
+static int imx911_write_regs(struct imx911 *imx911,
+			     const struct imx911_reg *regs, u32 len)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
+	unsigned int i;
+
+	for (i = 0; i < len; i++) {
+		int ret;
+
+		ret = imx911_write_reg(imx911, regs[i].address, 1, regs[i].val);
+		if (ret) {
+			dev_err_ratelimited(&client->dev,
+					    "Failed to write reg 0x%4.4x. error = %d\n",
+					    regs[i].address, ret);
+
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+/* Get bayer order based on flip setting. */
+static u32 imx911_get_format_code(struct imx911 *imx911)
+{
+	unsigned int i;
+
+	lockdep_assert_held(&imx911->mutex);
+
+	i = (imx911->vflip->val ? 2 : 0) |
+	    (imx911->hflip->val ? 1 : 0);
+
+	return codes[i];
+}
+
+static void imx911_set_default_format(struct imx911 *imx911)
+{
+	struct v4l2_mbus_framefmt *fmt = &imx911->fmt;
+
+	/* Set default mode to max resolution */
+	imx911->mode = &supported_modes_10bit_no_hdr[0];
+
+	/* fmt->code not set as it will always be computed based on flips */
+	fmt->colorspace = V4L2_COLORSPACE_RAW;
+	fmt->ycbcr_enc = V4L2_MAP_YCBCR_ENC_DEFAULT(fmt->colorspace);
+	fmt->quantization = V4L2_MAP_QUANTIZATION_DEFAULT(true,
+							  fmt->colorspace,
+							  fmt->ycbcr_enc);
+	fmt->xfer_func = V4L2_MAP_XFER_FUNC_DEFAULT(fmt->colorspace);
+	fmt->width = imx911->mode->width;
+	fmt->height = imx911->mode->height;
+	fmt->field = V4L2_FIELD_NONE;
+}
+
+static int imx911_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
+{
+	struct imx911 *imx911 = to_imx911(sd);
+	struct v4l2_mbus_framefmt *try_fmt_img =
+		v4l2_subdev_get_try_format(sd, fh->state, IMAGE_PAD);
+	struct v4l2_mbus_framefmt *try_fmt_meta =
+		v4l2_subdev_get_try_format(sd, fh->state, METADATA_PAD);
+	struct v4l2_rect *try_crop;
+
+	mutex_lock(&imx911->mutex);
+
+	/* Initialize try_fmt for the image pad */
+	if (imx911->hdr_mode->val) {
+		try_fmt_img->width = supported_modes_10bit_hdr[0].width;
+		try_fmt_img->height = supported_modes_10bit_hdr[0].height;
+	} else {
+		try_fmt_img->width = supported_modes_10bit_no_hdr[0].width;
+		try_fmt_img->height = supported_modes_10bit_no_hdr[0].height;
+	}
+	try_fmt_img->code = imx911_get_format_code(imx911);
+	try_fmt_img->field = V4L2_FIELD_NONE;
+
+	/* Initialize try_fmt for the embedded metadata pad */
+	try_fmt_meta->width = IMX708_EMBEDDED_LINE_WIDTH;
+	try_fmt_meta->height = IMX708_NUM_EMBEDDED_LINES;
+	try_fmt_meta->code = MEDIA_BUS_FMT_SENSOR_DATA;
+	try_fmt_meta->field = V4L2_FIELD_NONE;
+
+	/* Initialize try_crop */
+	try_crop = v4l2_subdev_get_try_crop(sd, fh->state, IMAGE_PAD);
+	try_crop->left = IMX708_PIXEL_ARRAY_LEFT;
+	try_crop->top = IMX708_PIXEL_ARRAY_TOP;
+	try_crop->width = IMX708_PIXEL_ARRAY_WIDTH;
+	try_crop->height = IMX708_PIXEL_ARRAY_HEIGHT;
+
+	mutex_unlock(&imx911->mutex);
+
+	return 0;
+}
+
+static int imx911_set_exposure(struct imx911 *imx911, unsigned int val)
+{
+	val = max(val, imx911->mode->exposure_lines_min);
+	val -= val % imx911->mode->exposure_lines_step;
+
+	/*
+	 * In HDR mode this will set the longest exposure. The sensor
+	 * will automatically divide the medium and short ones by 4,16.
+	 */
+	return imx911_write_reg(imx911, IMX708_REG_EXPOSURE,
+				IMX708_REG_VALUE_16BIT,
+				val >> imx911->long_exp_shift);
+}
+
+static void imx911_adjust_exposure_range(struct imx911 *imx911,
+					 struct v4l2_ctrl *ctrl)
+{
+	int exposure_max, exposure_def;
+
+	/* Honour the VBLANK limits when setting exposure. */
+	exposure_max = imx911->mode->height + imx911->vblank->val -
+		IMX708_EXPOSURE_OFFSET;
+	exposure_def = min(exposure_max, imx911->exposure->val);
+	__v4l2_ctrl_modify_range(imx911->exposure, imx911->exposure->minimum,
+				 exposure_max, imx911->exposure->step,
+				 exposure_def);
+}
+
+static int imx911_set_analogue_gain(struct imx911 *imx911, unsigned int val)
+{
+	int ret;
+
+	/*
+	 * In HDR mode this will set the gain for the longest exposure,
+	 * and by default the sensor uses the same gain for all of them.
+	 */
+	ret = imx911_write_reg(imx911, IMX708_REG_ANALOG_GAIN,
+			       IMX708_REG_VALUE_16BIT, val);
+
+	return ret;
+}
+
+static int imx911_set_frame_length(struct imx911 *imx911, unsigned int val)
+{
+	int ret;
+
+	imx911->long_exp_shift = 0;
+
+	while (val > IMX708_FRAME_LENGTH_MAX) {
+		imx911->long_exp_shift++;
+		val >>= 1;
+	}
+
+	ret = imx911_write_reg(imx911, IMX708_REG_FRAME_LENGTH,
+			       IMX708_REG_VALUE_16BIT, val);
+	if (ret)
+		return ret;
+
+	return imx911_write_reg(imx911, IMX708_LONG_EXP_SHIFT_REG,
+				IMX708_REG_VALUE_08BIT, imx911->long_exp_shift);
+}
+
+static void imx911_set_framing_limits(struct imx911 *imx911)
+{
+	const struct imx911_mode *mode = imx911->mode;
+	unsigned int hblank;
+
+	__v4l2_ctrl_modify_range(imx911->pixel_rate,
+				 mode->pixel_rate, mode->pixel_rate,
+				 1, mode->pixel_rate);
+
+	/* Update limits and set FPS to default */
+	__v4l2_ctrl_modify_range(imx911->vblank, mode->vblank_min,
+				 ((1 << IMX708_LONG_EXP_SHIFT_MAX) *
+					IMX708_FRAME_LENGTH_MAX) - mode->height,
+				 1, mode->vblank_default);
+
+	/*
+	 * Currently PPL is fixed to the mode specified value, so hblank
+	 * depends on mode->width only, and is not changeable in any
+	 * way other than changing the mode.
+	 */
+	hblank = mode->line_length_pix - mode->width;
+	__v4l2_ctrl_modify_range(imx911->hblank, hblank, hblank, 1, hblank);
+}
+
+static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct imx911 *imx911 =
+		container_of(ctrl->handler, struct imx911, ctrl_handler);
+	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
+	const struct imx911_mode *mode_list;
+	unsigned int code, num_modes;
+	int ret = 0;
+
+	switch (ctrl->id) {
+	case V4L2_CID_VBLANK:
+		/*
+		 * The VBLANK control may change the limits of usable exposure,
+		 * so check and adjust if necessary.
+		 */
+		imx911_adjust_exposure_range(imx911, ctrl);
+		break;
+
+	case V4L2_CID_WIDE_DYNAMIC_RANGE:
+		/*
+		 * The WIDE_DYNAMIC_RANGE control can also be applied immediately
+		 * as it doesn't set any registers. Don't do anything if the mode
+		 * already matches.
+		 */
+		if (imx911->mode && imx911->mode->hdr != ctrl->val) {
+			code = imx911_get_format_code(imx911);
+			get_mode_table(code, &mode_list, &num_modes, ctrl->val);
+			imx911->mode = v4l2_find_nearest_size(mode_list,
+							      num_modes,
+							      width, height,
+							      imx911->mode->width,
+							      imx911->mode->height);
+			imx911_set_framing_limits(imx911);
+		}
+		break;
+	}
+
+	/*
+	 * Applying V4L2 control value only happens
+	 * when power is up for streaming
+	 */
+	if (pm_runtime_get_if_in_use(&client->dev) == 0)
+		return 0;
+
+	switch (ctrl->id) {
+	case V4L2_CID_ANALOGUE_GAIN:
+		imx911_set_analogue_gain(imx911, ctrl->val);
+		break;
+	case V4L2_CID_EXPOSURE:
+		ret = imx911_set_exposure(imx911, ctrl->val);
+		break;
+	case V4L2_CID_DIGITAL_GAIN:
+		ret = imx911_write_reg(imx911, IMX708_REG_DIGITAL_GAIN,
+				       IMX708_REG_VALUE_16BIT, ctrl->val);
+		break;
+	case V4L2_CID_TEST_PATTERN:
+		ret = imx911_write_reg(imx911, IMX708_REG_TEST_PATTERN,
+				       IMX708_REG_VALUE_16BIT,
+				       imx911_test_pattern_val[ctrl->val]);
+		break;
+	case V4L2_CID_TEST_PATTERN_RED:
+		ret = imx911_write_reg(imx911, IMX708_REG_TEST_PATTERN_R,
+				       IMX708_REG_VALUE_16BIT, ctrl->val);
+		break;
+	case V4L2_CID_TEST_PATTERN_GREENR:
+		ret = imx911_write_reg(imx911, IMX708_REG_TEST_PATTERN_GR,
+				       IMX708_REG_VALUE_16BIT, ctrl->val);
+		break;
+	case V4L2_CID_TEST_PATTERN_BLUE:
+		ret = imx911_write_reg(imx911, IMX708_REG_TEST_PATTERN_B,
+				       IMX708_REG_VALUE_16BIT, ctrl->val);
+		break;
+	case V4L2_CID_TEST_PATTERN_GREENB:
+		ret = imx911_write_reg(imx911, IMX708_REG_TEST_PATTERN_GB,
+				       IMX708_REG_VALUE_16BIT, ctrl->val);
+		break;
+	case V4L2_CID_HFLIP:
+	case V4L2_CID_VFLIP:
+		ret = imx911_write_reg(imx911, IMX708_REG_ORIENTATION, 1,
+				       imx911->hflip->val |
+				       imx911->vflip->val << 1);
+		break;
+	case V4L2_CID_VBLANK:
+		ret = imx911_set_frame_length(imx911,
+					      imx911->mode->height + ctrl->val);
+		break;
+	case V4L2_CID_NOTIFY_GAINS:
+		ret = imx911_write_reg(imx911, IMX708_REG_COLOUR_BALANCE_BLUE,
+				       IMX708_REG_VALUE_16BIT,
+				       ctrl->p_new.p_u32[0]);
+		if (ret)
+			break;
+		ret = imx911_write_reg(imx911, IMX708_REG_COLOUR_BALANCE_RED,
+				       IMX708_REG_VALUE_16BIT,
+				       ctrl->p_new.p_u32[3]);
+		break;
+	case V4L2_CID_WIDE_DYNAMIC_RANGE:
+		/* Already handled above. */
+		break;
+	default:
+		dev_info(&client->dev,
+			 "ctrl(id:0x%x,val:0x%x) is not handled\n",
+			 ctrl->id, ctrl->val);
+		ret = -EINVAL;
+		break;
+	}
+
+	pm_runtime_put(&client->dev);
+
+	return ret;
+}
+
+static const struct v4l2_ctrl_ops imx911_ctrl_ops = {
+	.s_ctrl = imx911_set_ctrl,
+};
+
+static int imx911_enum_mbus_code(struct v4l2_subdev *sd,
+				 struct v4l2_subdev_state *sd_state,
+				 struct v4l2_subdev_mbus_code_enum *code)
+{
+	struct imx911 *imx911 = to_imx911(sd);
+
+	if (code->pad >= NUM_PADS)
+		return -EINVAL;
+
+	if (code->pad == IMAGE_PAD) {
+		if (code->index >= (ARRAY_SIZE(codes) / 4))
+			return -EINVAL;
+
+		code->code = imx911_get_format_code(imx911);
+	} else {
+		if (code->index > 0)
+			return -EINVAL;
+
+		code->code = MEDIA_BUS_FMT_SENSOR_DATA;
+	}
+
+	return 0;
+}
+
+static int imx911_enum_frame_size(struct v4l2_subdev *sd,
+				  struct v4l2_subdev_state *sd_state,
+				  struct v4l2_subdev_frame_size_enum *fse)
+{
+	struct imx911 *imx911 = to_imx911(sd);
+
+	if (fse->pad >= NUM_PADS)
+		return -EINVAL;
+
+	if (fse->pad == IMAGE_PAD) {
+		const struct imx911_mode *mode_list;
+		unsigned int num_modes;
+
+		get_mode_table(fse->code, &mode_list, &num_modes,
+			       imx911->hdr_mode->val);
+
+		if (fse->index >= num_modes)
+			return -EINVAL;
+
+		if (fse->code != imx911_get_format_code(imx911))
+			return -EINVAL;
+
+		fse->min_width = mode_list[fse->index].width;
+		fse->max_width = fse->min_width;
+		fse->min_height = mode_list[fse->index].height;
+		fse->max_height = fse->min_height;
+	} else {
+		if (fse->code != MEDIA_BUS_FMT_SENSOR_DATA || fse->index > 0)
+			return -EINVAL;
+
+		fse->min_width = IMX708_EMBEDDED_LINE_WIDTH;
+		fse->max_width = fse->min_width;
+		fse->min_height = IMX708_NUM_EMBEDDED_LINES;
+		fse->max_height = fse->min_height;
+	}
+
+	return 0;
+}
+
+static void imx911_reset_colorspace(struct v4l2_mbus_framefmt *fmt)
+{
+	fmt->colorspace = V4L2_COLORSPACE_RAW;
+	fmt->ycbcr_enc = V4L2_MAP_YCBCR_ENC_DEFAULT(fmt->colorspace);
+	fmt->quantization = V4L2_MAP_QUANTIZATION_DEFAULT(true,
+							  fmt->colorspace,
+							  fmt->ycbcr_enc);
+	fmt->xfer_func = V4L2_MAP_XFER_FUNC_DEFAULT(fmt->colorspace);
+}
+
+static void imx911_update_image_pad_format(struct imx911 *imx911,
+					   const struct imx911_mode *mode,
+					   struct v4l2_subdev_format *fmt)
+{
+	fmt->format.width = mode->width;
+	fmt->format.height = mode->height;
+	fmt->format.field = V4L2_FIELD_NONE;
+	imx911_reset_colorspace(&fmt->format);
+}
+
+static void imx911_update_metadata_pad_format(struct v4l2_subdev_format *fmt)
+{
+	fmt->format.width = IMX708_EMBEDDED_LINE_WIDTH;
+	fmt->format.height = IMX708_NUM_EMBEDDED_LINES;
+	fmt->format.code = MEDIA_BUS_FMT_SENSOR_DATA;
+	fmt->format.field = V4L2_FIELD_NONE;
+}
+
+static int imx911_get_pad_format(struct v4l2_subdev *sd,
+				 struct v4l2_subdev_state *sd_state,
+				 struct v4l2_subdev_format *fmt)
+{
+	struct imx911 *imx911 = to_imx911(sd);
+
+	if (fmt->pad >= NUM_PADS)
+		return -EINVAL;
+
+	mutex_lock(&imx911->mutex);
+
+	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
+		struct v4l2_mbus_framefmt *try_fmt =
+			v4l2_subdev_get_try_format(&imx911->sd, sd_state,
+						   fmt->pad);
+		/* update the code which could change due to vflip or hflip */
+		try_fmt->code = fmt->pad == IMAGE_PAD ?
+				imx911_get_format_code(imx911) :
+				MEDIA_BUS_FMT_SENSOR_DATA;
+		fmt->format = *try_fmt;
+	} else {
+		if (fmt->pad == IMAGE_PAD) {
+			imx911_update_image_pad_format(imx911, imx911->mode,
+						       fmt);
+			fmt->format.code = imx911_get_format_code(imx911);
+		} else {
+			imx911_update_metadata_pad_format(fmt);
+		}
+	}
+
+	mutex_unlock(&imx911->mutex);
+	return 0;
+}
+
+static int imx911_set_pad_format(struct v4l2_subdev *sd,
+				 struct v4l2_subdev_state *sd_state,
+				 struct v4l2_subdev_format *fmt)
+{
+	struct v4l2_mbus_framefmt *framefmt;
+	const struct imx911_mode *mode;
+	struct imx911 *imx911 = to_imx911(sd);
+
+	if (fmt->pad >= NUM_PADS)
+		return -EINVAL;
+
+	mutex_lock(&imx911->mutex);
+
+	if (fmt->pad == IMAGE_PAD) {
+		const struct imx911_mode *mode_list;
+		unsigned int num_modes;
+
+		/* Bayer order varies with flips */
+		fmt->format.code = imx911_get_format_code(imx911);
+
+		get_mode_table(fmt->format.code, &mode_list, &num_modes,
+			       imx911->hdr_mode->val);
+
+		mode = v4l2_find_nearest_size(mode_list,
+					      num_modes,
+					      width, height,
+					      fmt->format.width,
+					      fmt->format.height);
+		imx911_update_image_pad_format(imx911, mode, fmt);
+		if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
+			framefmt = v4l2_subdev_get_try_format(sd, sd_state,
+							      fmt->pad);
+			*framefmt = fmt->format;
+		} else {
+			imx911->mode = mode;
+			imx911_set_framing_limits(imx911);
+		}
+	} else {
+		if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
+			framefmt = v4l2_subdev_get_try_format(sd, sd_state,
+							      fmt->pad);
+			*framefmt = fmt->format;
+		} else {
+			/* Only one embedded data mode is supported */
+			imx911_update_metadata_pad_format(fmt);
+		}
+	}
+
+	mutex_unlock(&imx911->mutex);
+
+	return 0;
+}
+
+static const struct v4l2_rect *
+__imx911_get_pad_crop(struct imx911 *imx911, struct v4l2_subdev_state *sd_state,
+		      unsigned int pad, enum v4l2_subdev_format_whence which)
+{
+	switch (which) {
+	case V4L2_SUBDEV_FORMAT_TRY:
+		return v4l2_subdev_get_try_crop(&imx911->sd, sd_state, pad);
+	case V4L2_SUBDEV_FORMAT_ACTIVE:
+		return &imx911->mode->crop;
+	}
+
+	return NULL;
+}
+
+static int imx911_get_selection(struct v4l2_subdev *sd,
+				struct v4l2_subdev_state *sd_state,
+				struct v4l2_subdev_selection *sel)
+{
+	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP: {
+		struct imx911 *imx911 = to_imx911(sd);
+
+		mutex_lock(&imx911->mutex);
+		sel->r = *__imx911_get_pad_crop(imx911, sd_state, sel->pad,
+						sel->which);
+		mutex_unlock(&imx911->mutex);
+
+		return 0;
+	}
+
+	case V4L2_SEL_TGT_NATIVE_SIZE:
+		sel->r.left = 0;
+		sel->r.top = 0;
+		sel->r.width = IMX708_NATIVE_WIDTH;
+		sel->r.height = IMX708_NATIVE_HEIGHT;
+
+		return 0;
+
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+		sel->r.left = IMX708_PIXEL_ARRAY_LEFT;
+		sel->r.top = IMX708_PIXEL_ARRAY_TOP;
+		sel->r.width = IMX708_PIXEL_ARRAY_WIDTH;
+		sel->r.height = IMX708_PIXEL_ARRAY_HEIGHT;
+
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+/* Start streaming */
+static int imx911_start_streaming(struct imx911 *imx911)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
+	const struct imx911_reg_list *reg_list, *freq_regs;
+	int i, ret;
+	u32 val;
+
+	if (!imx911->common_regs_written) {
+		ret = imx911_write_regs(imx911, mode_common_regs,
+					ARRAY_SIZE(mode_common_regs));
+		if (ret) {
+			dev_err(&client->dev, "%s failed to set common settings\n",
+				__func__);
+			return ret;
+		}
+
+		ret = imx911_read_reg(imx911, IMX708_REG_BASE_SPC_GAINS_L,
+				      IMX708_REG_VALUE_08BIT, &val);
+		if (ret == 0 && val == 0x40) {
+			for (i = 0; i < 54 && ret == 0; i++) {
+				ret = imx911_write_reg(imx911,
+						       IMX708_REG_BASE_SPC_GAINS_L + i,
+						       IMX708_REG_VALUE_08BIT,
+						       pdaf_gains[0][i % 9]);
+			}
+			for (i = 0; i < 54 && ret == 0; i++) {
+				ret = imx911_write_reg(imx911,
+						       IMX708_REG_BASE_SPC_GAINS_R + i,
+						       IMX708_REG_VALUE_08BIT,
+						       pdaf_gains[1][i % 9]);
+			}
+		}
+		if (ret) {
+			dev_err(&client->dev, "%s failed to set PDAF gains\n",
+				__func__);
+			return ret;
+		}
+
+		imx911->common_regs_written = true;
+	}
+
+	/* Apply default values of current mode */
+	reg_list = &imx911->mode->reg_list;
+	ret = imx911_write_regs(imx911, reg_list->regs, reg_list->num_of_regs);
+	if (ret) {
+		dev_err(&client->dev, "%s failed to set mode\n", __func__);
+		return ret;
+	}
+
+	/* Update the link frequency registers */
+	freq_regs = &link_freq_regs[imx911->link_freq_idx];
+	ret = imx911_write_regs(imx911, freq_regs->regs,
+				freq_regs->num_of_regs);
+	if (ret) {
+		dev_err(&client->dev, "%s failed to set link frequency registers\n",
+			__func__);
+		return ret;
+	}
+
+	/* Quad Bayer re-mosaic adjustments (for full-resolution mode only) */
+	if (imx911->mode->remosaic && qbc_adjust > 0) {
+		imx911_write_reg(imx911, IMX708_LPF_INTENSITY,
+				 IMX708_REG_VALUE_08BIT, qbc_adjust);
+		imx911_write_reg(imx911,
+				 IMX708_LPF_INTENSITY_EN,
+				 IMX708_REG_VALUE_08BIT,
+				 IMX708_LPF_INTENSITY_ENABLED);
+	} else {
+		imx911_write_reg(imx911,
+				 IMX708_LPF_INTENSITY_EN,
+				 IMX708_REG_VALUE_08BIT,
+				 IMX708_LPF_INTENSITY_DISABLED);
+	}
+
+	/* Apply customized values from user */
+	ret =  __v4l2_ctrl_handler_setup(imx911->sd.ctrl_handler);
+	if (ret)
+		return ret;
+
+	/* set stream on register */
+	return imx911_write_reg(imx911, IMX708_REG_MODE_SELECT,
+				IMX708_REG_VALUE_08BIT, IMX708_MODE_STREAMING);
+}
+
+/* Stop streaming */
+static void imx911_stop_streaming(struct imx911 *imx911)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
+	int ret;
+
+	/* set stream off register */
+	ret = imx911_write_reg(imx911, IMX708_REG_MODE_SELECT,
+			       IMX708_REG_VALUE_08BIT, IMX708_MODE_STANDBY);
+	if (ret)
+		dev_err(&client->dev, "%s failed to set stream\n", __func__);
+}
+
+static int imx911_set_stream(struct v4l2_subdev *sd, int enable)
+{
+	struct imx911 *imx911 = to_imx911(sd);
+	struct i2c_client *client = v4l2_get_subdevdata(sd);
+	int ret = 0;
+
+	mutex_lock(&imx911->mutex);
+	if (imx911->streaming == enable) {
+		mutex_unlock(&imx911->mutex);
+		return 0;
+	}
+
+	if (enable) {
+		ret = pm_runtime_get_sync(&client->dev);
+		if (ret < 0) {
+			pm_runtime_put_noidle(&client->dev);
+			goto err_unlock;
+		}
+
+		/*
+		 * Apply default & customized values
+		 * and then start streaming.
+		 */
+		ret = imx911_start_streaming(imx911);
+		if (ret)
+			goto err_rpm_put;
+	} else {
+		imx911_stop_streaming(imx911);
+		pm_runtime_put(&client->dev);
+	}
+
+	imx911->streaming = enable;
+
+	/* vflip/hflip and hdr mode cannot change during streaming */
+	__v4l2_ctrl_grab(imx911->vflip, enable);
+	__v4l2_ctrl_grab(imx911->hflip, enable);
+	__v4l2_ctrl_grab(imx911->hdr_mode, enable);
+
+	mutex_unlock(&imx911->mutex);
+
+	return ret;
+
+err_rpm_put:
+	pm_runtime_put(&client->dev);
+err_unlock:
+	mutex_unlock(&imx911->mutex);
+
+	return ret;
+}
+
+/* Power/clock management functions */
+static int imx911_power_on(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+	struct imx911 *imx911 = to_imx911(sd);
+	int ret;
+
+	ret = regulator_bulk_enable(ARRAY_SIZE(imx911_supply_name),
+				    imx911->supplies);
+	if (ret) {
+		dev_err(&client->dev, "%s: failed to enable regulators\n",
+			__func__);
+		return ret;
+	}
+
+	ret = clk_prepare_enable(imx911->inclk);
+	if (ret) {
+		dev_err(&client->dev, "%s: failed to enable clock\n",
+			__func__);
+		goto reg_off;
+	}
+
+	gpiod_set_value_cansleep(imx911->reset_gpio, 1);
+	usleep_range(IMX708_XCLR_MIN_DELAY_US,
+		     IMX708_XCLR_MIN_DELAY_US + IMX708_XCLR_DELAY_RANGE_US);
+
+	return 0;
+
+reg_off:
+	regulator_bulk_disable(ARRAY_SIZE(imx911_supply_name),
+			       imx911->supplies);
+	return ret;
+}
+
+static int imx911_power_off(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+	struct imx911 *imx911 = to_imx911(sd);
+
+	gpiod_set_value_cansleep(imx911->reset_gpio, 0);
+	regulator_bulk_disable(ARRAY_SIZE(imx911_supply_name),
+			       imx911->supplies);
+	clk_disable_unprepare(imx911->inclk);
+
+	/* Force reprogramming of the common registers when powered up again. */
+	imx911->common_regs_written = false;
+
+	return 0;
+}
+
+static int __maybe_unused imx911_suspend(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+	struct imx911 *imx911 = to_imx911(sd);
+
+	if (imx911->streaming)
+		imx911_stop_streaming(imx911);
+
+	return 0;
+}
+
+static int __maybe_unused imx911_resume(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+	struct imx911 *imx911 = to_imx911(sd);
+	int ret;
+
+	if (imx911->streaming) {
+		ret = imx911_start_streaming(imx911);
+		if (ret)
+			goto error;
+	}
+
+	return 0;
+
+error:
+	imx911_stop_streaming(imx911);
+	imx911->streaming = 0;
+	return ret;
+}
+
+static int imx911_get_regulators(struct imx911 *imx911)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(imx911_supply_name); i++)
+		imx911->supplies[i].supply = imx911_supply_name[i];
+
+	return devm_regulator_bulk_get(&client->dev,
+				       ARRAY_SIZE(imx911_supply_name),
+				       imx911->supplies);
+}
+
+/* Verify chip ID */
+static int imx911_identify_module(struct imx911 *imx911)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
+	int ret;
+	u32 val;
+
+	ret = imx911_read_reg(imx911, IMX708_REG_CHIP_ID,
+			      IMX708_REG_VALUE_16BIT, &val);
+	if (ret) {
+		dev_err(&client->dev, "failed to read chip id %x, with error %d\n",
+			IMX708_CHIP_ID, ret);
+		return ret;
+	}
+
+	if (val != IMX708_CHIP_ID) {
+		dev_err(&client->dev, "chip id mismatch: %x!=%x\n",
+			IMX708_CHIP_ID, val);
+		return -EIO;
+	}
+
+	ret = imx911_read_reg(imx911, 0x0000, IMX708_REG_VALUE_16BIT, &val);
+	if (!ret) {
+		dev_info(&client->dev, "camera module ID 0x%04x\n", val);
+		snprintf(imx911->sd.name, sizeof(imx911->sd.name), "imx911%s%s",
+			 val & 0x02 ? "_wide" : "",
+			 val & 0x80 ? "_noir" : "");
+	}
+
+	return 0;
+}
+
+static const struct v4l2_subdev_core_ops imx911_core_ops = {
+	.subscribe_event = v4l2_ctrl_subdev_subscribe_event,
+	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
+};
+
+static const struct v4l2_subdev_video_ops imx911_video_ops = {
+	.s_stream = imx911_set_stream,
+};
+
+static const struct v4l2_subdev_pad_ops imx911_pad_ops = {
+	.enum_mbus_code = imx911_enum_mbus_code,
+	.get_fmt = imx911_get_pad_format,
+	.set_fmt = imx911_set_pad_format,
+	.get_selection = imx911_get_selection,
+	.enum_frame_size = imx911_enum_frame_size,
+};
+
+static const struct v4l2_subdev_ops imx911_subdev_ops = {
+	.core = &imx911_core_ops,
+	.video = &imx911_video_ops,
+	.pad = &imx911_pad_ops,
+};
+
+static const struct v4l2_subdev_internal_ops imx911_internal_ops = {
+	.open = imx911_open,
+};
+
+static const struct v4l2_ctrl_config imx911_notify_gains_ctrl = {
+	.ops = &imx911_ctrl_ops,
+	.id = V4L2_CID_NOTIFY_GAINS,
+	.type = V4L2_CTRL_TYPE_U32,
+	.min = IMX708_COLOUR_BALANCE_MIN,
+	.max = IMX708_COLOUR_BALANCE_MAX,
+	.step = IMX708_COLOUR_BALANCE_STEP,
+	.def = IMX708_COLOUR_BALANCE_DEFAULT,
+	.dims = { 4 },
+	.elem_size = sizeof(u32),
+};
+
+/* Initialize control handlers */
+static int imx911_init_controls(struct imx911 *imx911)
+{
+	struct v4l2_ctrl_handler *ctrl_hdlr;
+	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
+	struct v4l2_fwnode_device_properties props;
+	struct v4l2_ctrl *ctrl;
+	unsigned int i;
+	int ret;
+
+	ctrl_hdlr = &imx911->ctrl_handler;
+	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 16);
+	if (ret)
+		return ret;
+
+	mutex_init(&imx911->mutex);
+	ctrl_hdlr->lock = &imx911->mutex;
+
+	/* By default, PIXEL_RATE is read only */
+	imx911->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
+					       V4L2_CID_PIXEL_RATE,
+					       IMX708_INITIAL_PIXEL_RATE,
+					       IMX708_INITIAL_PIXEL_RATE, 1,
+					       IMX708_INITIAL_PIXEL_RATE);
+
+	ctrl = v4l2_ctrl_new_int_menu(ctrl_hdlr, &imx911_ctrl_ops,
+				      V4L2_CID_LINK_FREQ, 0, 0,
+				      &link_freqs[imx911->link_freq_idx]);
+	if (ctrl)
+		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+
+	/*
+	 * Create the controls here, but mode specific limits are setup
+	 * in the imx911_set_framing_limits() call below.
+	 */
+	imx911->vblank = v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
+					   V4L2_CID_VBLANK, 0, 0xffff, 1, 0);
+	imx911->hblank = v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
+					   V4L2_CID_HBLANK, 0, 0xffff, 1, 0);
+
+	imx911->exposure = v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
+					     V4L2_CID_EXPOSURE,
+					     IMX708_EXPOSURE_MIN,
+					     IMX708_EXPOSURE_MAX,
+					     IMX708_EXPOSURE_STEP,
+					     IMX708_EXPOSURE_DEFAULT);
+
+	v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
+			  IMX708_ANA_GAIN_MIN, IMX708_ANA_GAIN_MAX,
+			  IMX708_ANA_GAIN_STEP, IMX708_ANA_GAIN_DEFAULT);
+
+	v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops, V4L2_CID_DIGITAL_GAIN,
+			  IMX708_DGTL_GAIN_MIN, IMX708_DGTL_GAIN_MAX,
+			  IMX708_DGTL_GAIN_STEP, IMX708_DGTL_GAIN_DEFAULT);
+
+	imx911->hflip = v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
+					  V4L2_CID_HFLIP, 0, 1, 1, 0);
+
+	imx911->vflip = v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
+					  V4L2_CID_VFLIP, 0, 1, 1, 0);
+	v4l2_ctrl_cluster(2, &imx911->hflip);
+
+	v4l2_ctrl_new_std_menu_items(ctrl_hdlr, &imx911_ctrl_ops,
+				     V4L2_CID_TEST_PATTERN,
+				     ARRAY_SIZE(imx911_test_pattern_menu) - 1,
+				     0, 0, imx911_test_pattern_menu);
+	for (i = 0; i < 4; i++) {
+		/*
+		 * The assumption is that
+		 * V4L2_CID_TEST_PATTERN_GREENR == V4L2_CID_TEST_PATTERN_RED + 1
+		 * V4L2_CID_TEST_PATTERN_BLUE   == V4L2_CID_TEST_PATTERN_RED + 2
+		 * V4L2_CID_TEST_PATTERN_GREENB == V4L2_CID_TEST_PATTERN_RED + 3
+		 */
+		v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
+				  V4L2_CID_TEST_PATTERN_RED + i,
+				  IMX708_TEST_PATTERN_COLOUR_MIN,
+				  IMX708_TEST_PATTERN_COLOUR_MAX,
+				  IMX708_TEST_PATTERN_COLOUR_STEP,
+				  IMX708_TEST_PATTERN_COLOUR_MAX);
+		/* The "Solid color" pattern is white by default */
+	}
+
+	v4l2_ctrl_new_custom(ctrl_hdlr, &imx911_notify_gains_ctrl, NULL);
+
+	imx911->hdr_mode = v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
+					     V4L2_CID_WIDE_DYNAMIC_RANGE,
+					     0, 1, 1, 0);
+
+	ret = v4l2_fwnode_device_parse(&client->dev, &props);
+	if (ret)
+		goto error;
+
+	v4l2_ctrl_new_fwnode_properties(ctrl_hdlr, &imx911_ctrl_ops, &props);
+
+	if (ctrl_hdlr->error) {
+		ret = ctrl_hdlr->error;
+		dev_err(&client->dev, "%s control init failed (%d)\n",
+			__func__, ret);
+		goto error;
+	}
+
+	imx911->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	imx911->hflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
+	imx911->vflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
+	imx911->hdr_mode->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
+
+	imx911->sd.ctrl_handler = ctrl_hdlr;
+
+	/* Setup exposure and frame/line length limits. */
+	imx911_set_framing_limits(imx911);
+
+	return 0;
+
+error:
+	v4l2_ctrl_handler_free(ctrl_hdlr);
+	mutex_destroy(&imx911->mutex);
+
+	return ret;
+}
+
+static void imx911_free_controls(struct imx911 *imx911)
+{
+	v4l2_ctrl_handler_free(imx911->sd.ctrl_handler);
+	mutex_destroy(&imx911->mutex);
+}
+
+static int imx911_check_hwcfg(struct device *dev, struct imx911 *imx911)
+{
+	struct fwnode_handle *endpoint;
+	struct v4l2_fwnode_endpoint ep_cfg = {
+		.bus_type = V4L2_MBUS_CSI2_DPHY
+	};
+	int ret = -EINVAL;
+	int i;
+
+	endpoint = fwnode_graph_get_next_endpoint(dev_fwnode(dev), NULL);
+	if (!endpoint) {
+		dev_err(dev, "endpoint node not found\n");
+		return -EINVAL;
+	}
+
+	if (v4l2_fwnode_endpoint_alloc_parse(endpoint, &ep_cfg)) {
+		dev_err(dev, "could not parse endpoint\n");
+		goto error_out;
+	}
+
+	/* Check the number of MIPI CSI2 data lanes */
+	if (ep_cfg.bus.mipi_csi2.num_data_lanes != 2) {
+		dev_err(dev, "only 2 data lanes are currently supported\n");
+		goto error_out;
+	}
+
+	/* Check the link frequency set in device tree */
+	if (!ep_cfg.nr_of_link_frequencies) {
+		dev_err(dev, "link-frequency property not found in DT\n");
+		goto error_out;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(link_freqs); i++) {
+		if (link_freqs[i] == ep_cfg.link_frequencies[0]) {
+			imx911->link_freq_idx = i;
+			break;
+		}
+	}
+
+	if (i == ARRAY_SIZE(link_freqs)) {
+		dev_err(dev, "Link frequency not supported: %lld\n",
+			ep_cfg.link_frequencies[0]);
+			ret = -EINVAL;
+			goto error_out;
+	}
+
+	ret = 0;
+
+error_out:
+	v4l2_fwnode_endpoint_free(&ep_cfg);
+	fwnode_handle_put(endpoint);
+
+	return ret;
+}
+
+static int imx911_probe(struct i2c_client *client)
+{
+	struct device *dev = &client->dev;
+	struct imx911 *imx911;
+	int ret;
+
+	imx911 = devm_kzalloc(&client->dev, sizeof(*imx911), GFP_KERNEL);
+	if (!imx911)
+		return -ENOMEM;
+
+	v4l2_i2c_subdev_init(&imx911->sd, client, &imx911_subdev_ops);
+
+	/* Check the hardware configuration in device tree */
+	if (imx911_check_hwcfg(dev, imx911))
+		return -EINVAL;
+
+	/* Get system clock (inclk) */
+	imx911->inclk = devm_clk_get(dev, "inclk");
+	if (IS_ERR(imx911->inclk))
+		return dev_err_probe(dev, PTR_ERR(imx911->inclk),
+				     "failed to get inclk\n");
+
+	imx911->inclk_freq = clk_get_rate(imx911->inclk);
+	if (imx911->inclk_freq != IMX708_INCLK_FREQ)
+		return dev_err_probe(dev, -EINVAL,
+				     "inclk frequency not supported: %d Hz\n",
+				     imx911->inclk_freq);
+
+	ret = imx911_get_regulators(imx911);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to get regulators\n");
+
+	/* Request optional enable pin */
+	imx911->reset_gpio = devm_gpiod_get_optional(dev, "reset",
+						     GPIOD_OUT_HIGH);
+
+	/*
+	 * The sensor must be powered for imx911_identify_module()
+	 * to be able to read the CHIP_ID register
+	 */
+	ret = imx911_power_on(dev);
+	if (ret)
+		return ret;
+
+	ret = imx911_identify_module(imx911);
+	if (ret)
+		goto error_power_off;
+
+	/* Initialize default format */
+	imx911_set_default_format(imx911);
+
+	/* Enable runtime PM and turn off the device */
+	pm_runtime_set_active(dev);
+	pm_runtime_enable(dev);
+	pm_runtime_idle(dev);
+
+	/* This needs the pm runtime to be registered. */
+	ret = imx911_init_controls(imx911);
+	if (ret)
+		goto error_pm_runtime;
+
+	/* Initialize subdev */
+	imx911->sd.internal_ops = &imx911_internal_ops;
+	imx911->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE |
+			    V4L2_SUBDEV_FL_HAS_EVENTS;
+	imx911->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
+
+	/* Initialize source pads */
+	imx911->pad[IMAGE_PAD].flags = MEDIA_PAD_FL_SOURCE;
+	imx911->pad[METADATA_PAD].flags = MEDIA_PAD_FL_SOURCE;
+
+	ret = media_entity_pads_init(&imx911->sd.entity, NUM_PADS, imx911->pad);
+	if (ret) {
+		dev_err(dev, "failed to init entity pads: %d\n", ret);
+		goto error_handler_free;
+	}
+
+	ret = v4l2_async_register_subdev_sensor(&imx911->sd);
+	if (ret < 0) {
+		dev_err(dev, "failed to register sensor sub-device: %d\n", ret);
+		goto error_media_entity;
+	}
+
+	return 0;
+
+error_media_entity:
+	media_entity_cleanup(&imx911->sd.entity);
+
+error_handler_free:
+	imx911_free_controls(imx911);
+
+error_pm_runtime:
+	pm_runtime_disable(&client->dev);
+	pm_runtime_set_suspended(&client->dev);
+
+error_power_off:
+	imx911_power_off(&client->dev);
+
+	return ret;
+}
+
+static void imx911_remove(struct i2c_client *client)
+{
+	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+	struct imx911 *imx911 = to_imx911(sd);
+
+	v4l2_async_unregister_subdev(sd);
+	media_entity_cleanup(&sd->entity);
+	imx911_free_controls(imx911);
+
+	pm_runtime_disable(&client->dev);
+	if (!pm_runtime_status_suspended(&client->dev))
+		imx911_power_off(&client->dev);
+	pm_runtime_set_suspended(&client->dev);
+}
+
+static const struct of_device_id imx911_dt_ids[] = {
+	{ .compatible = "sony,imx911" },
+	{ /* sentinel */ }
+};
+MODULE_DEVICE_TABLE(of, imx911_dt_ids);
+
+static const struct dev_pm_ops imx911_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(imx911_suspend, imx911_resume)
+	SET_RUNTIME_PM_OPS(imx911_power_off, imx911_power_on, NULL)
+};
+
+static struct i2c_driver imx911_i2c_driver = {
+	.driver = {
+		.name = "imx911",
+		.of_match_table	= imx911_dt_ids,
+		.pm = &imx911_pm_ops,
+	},
+	.probe = imx911_probe,
+	.remove = imx911_remove,
+};
+
+module_i2c_driver(imx911_i2c_driver);
+
+MODULE_AUTHOR("David Plowman <david.plowman@raspberrypi.com>");
+MODULE_DESCRIPTION("Sony IMX708 sensor driver");
+MODULE_LICENSE("GPL v2");
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * tc358743 - Toshiba HDMI to CSI-2 bridge
@@ -67,7 +2183,7 @@ static const struct v4l2_dv_timings_cap tc358743_timings_cap = {
 			V4L2_DV_BT_CAP_CUSTOM)
 };
 
-struct tc358743_state {
+struct tc358743_HOLD {
 	struct tc358743_platform_data pdata;
 	struct v4l2_mbus_config_mipi_csi2 bus;
 	struct v4l2_subdev sd;
@@ -103,17 +2219,17 @@ static void tc358743_enable_interrupts(struct v4l2_subdev *sd,
 		bool cable_connected);
 static int tc358743_s_ctrl_detect_tx_5v(struct v4l2_subdev *sd);
 
-static inline struct tc358743_state *to_state(struct v4l2_subdev *sd)
+static inline struct tc358743_HOLD *to_tc3(struct v4l2_subdev *sd)
 {
-	return container_of(sd, struct tc358743_state, sd);
+	return container_of(sd, struct tc358743_HOLD, sd);
 }
 
 /* --------------- I2C --------------- */
 
 static int i2c_rd(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
 {
-	struct tc358743_state *state = to_state(sd);
-	struct i2c_client *client = state->i2c_client;
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct i2c_client *client = tc3->i2c_client;
 	int err;
 	u8 buf[2] = { reg >> 8, reg & 0xff };
 	struct i2c_msg msgs[] = {
@@ -141,8 +2257,8 @@ static int i2c_rd(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
 
 static void i2c_wr(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
 {
-	struct tc358743_state *state = to_state(sd);
-	struct i2c_client *client = state->i2c_client;
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct i2c_client *client = tc3->i2c_client;
 	int err, i;
 	struct i2c_msg msg;
 	u8 data[I2C_MAX_XFER_SIZE];
@@ -373,9 +2489,9 @@ static int tc358743_get_detected_timings(struct v4l2_subdev *sd,
 static void tc358743_delayed_work_enable_hotplug(struct work_struct *work)
 {
 	struct delayed_work *dwork = to_delayed_work(work);
-	struct tc358743_state *state = container_of(dwork,
-			struct tc358743_state, delayed_work_enable_hotplug);
-	struct v4l2_subdev *sd = &state->sd;
+	struct tc358743_HOLD *tc3 = container_of(dwork,
+			struct tc358743_HOLD, delayed_work_enable_hotplug);
+	struct v4l2_subdev *sd = &tc3->sd;
 
 	v4l2_dbg(2, debug, sd, "%s:\n", __func__);
 
@@ -406,11 +2522,11 @@ static void tc358743_set_hdmi_hdcp(struct v4l2_subdev *sd, bool enable)
 
 static void tc358743_disable_edid(struct v4l2_subdev *sd)
 {
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 
 	v4l2_dbg(2, debug, sd, "%s:\n", __func__);
 
-	cancel_delayed_work_sync(&state->delayed_work_enable_hotplug);
+	cancel_delayed_work_sync(&tc3->delayed_work_enable_hotplug);
 
 	/* DDC access to EDID is also disabled when hotplug is disabled. See
 	 * register DDC_CTL */
@@ -419,9 +2535,9 @@ static void tc358743_disable_edid(struct v4l2_subdev *sd)
 
 static void tc358743_enable_edid(struct v4l2_subdev *sd)
 {
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 
-	if (state->edid_blocks_written == 0) {
+	if (tc3->edid_blocks_written == 0) {
 		v4l2_dbg(2, debug, sd, "%s: no EDID -> no hotplug\n", __func__);
 		tc358743_s_ctrl_detect_tx_5v(sd);
 		return;
@@ -431,7 +2547,7 @@ static void tc358743_enable_edid(struct v4l2_subdev *sd)
 
 	/* Enable hotplug after 100 ms. DDC access to EDID is also enabled when
 	 * hotplug is enabled. See register DDC_CTL */
-	schedule_delayed_work(&state->delayed_work_enable_hotplug, HZ / 10);
+	schedule_delayed_work(&tc3->delayed_work_enable_hotplug, HZ / 10);
 
 	tc358743_enable_interrupts(sd, true);
 	tc358743_s_ctrl_detect_tx_5v(sd);
@@ -473,25 +2589,25 @@ static void print_avi_infoframe(struct v4l2_subdev *sd)
 
 static int tc358743_s_ctrl_detect_tx_5v(struct v4l2_subdev *sd)
 {
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 
-	return v4l2_ctrl_s_ctrl(state->detect_tx_5v_ctrl,
+	return v4l2_ctrl_s_ctrl(tc3->detect_tx_5v_ctrl,
 			tx_5v_power_present(sd));
 }
 
 static int tc358743_s_ctrl_audio_sampling_rate(struct v4l2_subdev *sd)
 {
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 
-	return v4l2_ctrl_s_ctrl(state->audio_sampling_rate_ctrl,
+	return v4l2_ctrl_s_ctrl(tc3->audio_sampling_rate_ctrl,
 			get_audio_sampling_rate(sd));
 }
 
 static int tc358743_s_ctrl_audio_present(struct v4l2_subdev *sd)
 {
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 
-	return v4l2_ctrl_s_ctrl(state->audio_present_ctrl,
+	return v4l2_ctrl_s_ctrl(tc3->audio_present_ctrl,
 			audio_present(sd));
 }
 
@@ -532,7 +2648,7 @@ static inline void tc358743_sleep_mode(struct v4l2_subdev *sd, bool enable)
 
 static inline void enable_stream(struct v4l2_subdev *sd, bool enable)
 {
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 
 	v4l2_dbg(3, debug, sd, "%s: %sable\n",
 			__func__, enable ? "en" : "dis");
@@ -540,28 +2656,28 @@ static inline void enable_stream(struct v4l2_subdev *sd, bool enable)
 	if (enable) {
 		/* It is critical for CSI receiver to see lane transition
 		 * LP11->HS. Set to non-continuous mode to enable clock lane
-		 * LP11 state. */
+		 * LP11 tc3. */
 		i2c_wr32(sd, TXOPTIONCNTRL, 0);
 		/* Set to continuous mode to trigger LP11->HS transition */
 		i2c_wr32(sd, TXOPTIONCNTRL, MASK_CONTCLKMODE);
 		/* Unmute video */
 		i2c_wr8(sd, VI_MUTE, MASK_AUTO_MUTE);
 	} else {
-		/* Mute video so that all data lanes go to LSP11 state.
+		/* Mute video so that all data lanes go to LSP11 tc3.
 		 * No data is output to CSI Tx block. */
 		i2c_wr8(sd, VI_MUTE, MASK_AUTO_MUTE | MASK_VI_MUTE);
 	}
 
-	mutex_lock(&state->confctl_mutex);
+	mutex_lock(&tc3->confctl_mutex);
 	i2c_wr16_and_or(sd, CONFCTL, ~(MASK_VBUFEN | MASK_ABUFEN),
 			enable ? (MASK_VBUFEN | MASK_ABUFEN) : 0x0);
-	mutex_unlock(&state->confctl_mutex);
+	mutex_unlock(&tc3->confctl_mutex);
 }
 
 static void tc358743_set_pll(struct v4l2_subdev *sd)
 {
-	struct tc358743_state *state = to_state(sd);
-	struct tc358743_platform_data *pdata = &state->pdata;
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_platform_data *pdata = &tc3->pdata;
 	u16 pllctl0 = i2c_rd16(sd, PLLCTL0);
 	u16 pllctl1 = i2c_rd16(sd, PLLCTL1);
 	u16 pllctl0_new = SET_PLL_PRD(pdata->pll_prd) |
@@ -599,8 +2715,8 @@ static void tc358743_set_pll(struct v4l2_subdev *sd)
 
 static void tc358743_set_ref_clk(struct v4l2_subdev *sd)
 {
-	struct tc358743_state *state = to_state(sd);
-	struct tc358743_platform_data *pdata = &state->pdata;
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_platform_data *pdata = &tc3->pdata;
 	u32 sys_freq;
 	u32 lockdet_ref;
 	u32 cec_freq;
@@ -648,9 +2764,9 @@ static void tc358743_set_ref_clk(struct v4l2_subdev *sd)
 
 static void tc358743_set_csi_color_space(struct v4l2_subdev *sd)
 {
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 
-	switch (state->mbus_fmt_code) {
+	switch (tc3->mbus_fmt_code) {
 	case MEDIA_BUS_FMT_UYVY8_1X16:
 		v4l2_dbg(2, debug, sd, "%s: YCbCr 422 16-bit\n", __func__);
 		i2c_wr8_and_or(sd, VOUT_SET2,
@@ -658,10 +2774,10 @@ static void tc358743_set_csi_color_space(struct v4l2_subdev *sd)
 				MASK_SEL422 | MASK_VOUT_422FIL_100);
 		i2c_wr8_and_or(sd, VI_REP, ~MASK_VOUT_COLOR_SEL & 0xff,
 				MASK_VOUT_COLOR_601_YCBCR_LIMITED);
-		mutex_lock(&state->confctl_mutex);
+		mutex_lock(&tc3->confctl_mutex);
 		i2c_wr16_and_or(sd, CONFCTL, ~MASK_YCBCRFMT,
 				MASK_YCBCRFMT_422_8_BIT);
-		mutex_unlock(&state->confctl_mutex);
+		mutex_unlock(&tc3->confctl_mutex);
 		break;
 	case MEDIA_BUS_FMT_RGB888_1X24:
 		v4l2_dbg(2, debug, sd, "%s: RGB 888 24-bit\n", __func__);
@@ -670,23 +2786,23 @@ static void tc358743_set_csi_color_space(struct v4l2_subdev *sd)
 				0x00);
 		i2c_wr8_and_or(sd, VI_REP, ~MASK_VOUT_COLOR_SEL & 0xff,
 				MASK_VOUT_COLOR_RGB_FULL);
-		mutex_lock(&state->confctl_mutex);
+		mutex_lock(&tc3->confctl_mutex);
 		i2c_wr16_and_or(sd, CONFCTL, ~MASK_YCBCRFMT, 0);
-		mutex_unlock(&state->confctl_mutex);
+		mutex_unlock(&tc3->confctl_mutex);
 		break;
 	default:
 		v4l2_dbg(2, debug, sd, "%s: Unsupported format code 0x%x\n",
-				__func__, state->mbus_fmt_code);
+				__func__, tc3->mbus_fmt_code);
 	}
 }
 
 static unsigned tc358743_num_csi_lanes_needed(struct v4l2_subdev *sd)
 {
-	struct tc358743_state *state = to_state(sd);
-	struct v4l2_bt_timings *bt = &state->timings.bt;
-	struct tc358743_platform_data *pdata = &state->pdata;
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct v4l2_bt_timings *bt = &tc3->timings.bt;
+	struct tc358743_platform_data *pdata = &tc3->pdata;
 	u32 bits_pr_pixel =
-		(state->mbus_fmt_code == MEDIA_BUS_FMT_UYVY8_1X16) ?  16 : 24;
+		(tc3->mbus_fmt_code == MEDIA_BUS_FMT_UYVY8_1X16) ?  16 : 24;
 	u32 bps = bt->width * bt->height * fps(bt) * bits_pr_pixel;
 	u32 bps_pr_lane = (pdata->refclk_hz / pdata->pll_prd) * pdata->pll_fbd;
 
@@ -695,13 +2811,13 @@ static unsigned tc358743_num_csi_lanes_needed(struct v4l2_subdev *sd)
 
 static void tc358743_set_csi(struct v4l2_subdev *sd)
 {
-	struct tc358743_state *state = to_state(sd);
-	struct tc358743_platform_data *pdata = &state->pdata;
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_platform_data *pdata = &tc3->pdata;
 	unsigned lanes = tc358743_num_csi_lanes_needed(sd);
 
 	v4l2_dbg(3, debug, sd, "%s:\n", __func__);
 
-	state->csi_lanes_in_use = lanes;
+	tc3->csi_lanes_in_use = lanes;
 
 	tc358743_reset(sd, MASK_CTXRST);
 
@@ -733,7 +2849,7 @@ static void tc358743_set_csi(struct v4l2_subdev *sd)
 			((lanes > 2) ? MASK_D2M_HSTXVREGEN : 0x0) |
 			((lanes > 3) ? MASK_D3M_HSTXVREGEN : 0x0));
 
-	i2c_wr32(sd, TXOPTIONCNTRL, (state->bus.flags &
+	i2c_wr32(sd, TXOPTIONCNTRL, (tc3->bus.flags &
 		 V4L2_MBUS_CSI2_NONCONTINUOUS_CLOCK) ? 0 : MASK_CONTCLKMODE);
 	i2c_wr32(sd, STARTCNTRL, MASK_START);
 	i2c_wr32(sd, CSI_START, MASK_STRT);
@@ -759,8 +2875,8 @@ static void tc358743_set_csi(struct v4l2_subdev *sd)
 
 static void tc358743_set_hdmi_phy(struct v4l2_subdev *sd)
 {
-	struct tc358743_state *state = to_state(sd);
-	struct tc358743_platform_data *pdata = &state->pdata;
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_platform_data *pdata = &tc3->pdata;
 
 	/* Default settings from REF_02, sheet "Source HDMI"
 	 * and custom settings as platform data */
@@ -789,7 +2905,7 @@ static void tc358743_set_hdmi_phy(struct v4l2_subdev *sd)
 
 static void tc358743_set_hdmi_audio(struct v4l2_subdev *sd)
 {
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 
 	/* Default settings from REF_02, sheet "Source HDMI" */
 	i2c_wr8(sd, FORCE_MUTE, 0x00);
@@ -807,10 +2923,10 @@ static void tc358743_set_hdmi_audio(struct v4l2_subdev *sd)
 	i2c_wr8(sd, SDO_MODE1, MASK_SDO_FMT_I2S);
 	i2c_wr8(sd, DIV_MODE, SET_DIV_DLY_MS(100));
 
-	mutex_lock(&state->confctl_mutex);
+	mutex_lock(&tc3->confctl_mutex);
 	i2c_wr16_and_or(sd, CONFCTL, 0xffff, MASK_AUDCHNUM_2 |
 			MASK_AUDOUTSEL_I2S | MASK_AUTOINDEX);
-	mutex_unlock(&state->confctl_mutex);
+	mutex_unlock(&tc3->confctl_mutex);
 }
 
 static void tc358743_set_hdmi_info_frame_mode(struct v4l2_subdev *sd)
@@ -829,8 +2945,8 @@ static void tc358743_set_hdmi_info_frame_mode(struct v4l2_subdev *sd)
 
 static void tc358743_initial_setup(struct v4l2_subdev *sd)
 {
-	struct tc358743_state *state = to_state(sd);
-	struct tc358743_platform_data *pdata = &state->pdata;
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_platform_data *pdata = &tc3->pdata;
 
 	/*
 	 * IR is not supported by this driver.
@@ -871,8 +2987,8 @@ static void tc358743_initial_setup(struct v4l2_subdev *sd)
 #ifdef CONFIG_VIDEO_TC358743_CEC
 static int tc358743_cec_adap_enable(struct cec_adapter *adap, bool enable)
 {
-	struct tc358743_state *state = adap->priv;
-	struct v4l2_subdev *sd = &state->sd;
+	struct tc358743_HOLD *tc3 = adap->priv;
+	struct v4l2_subdev *sd = &tc3->sd;
 
 	i2c_wr32(sd, CECIMSK, enable ? MASK_CECTIM | MASK_CECRIM : 0);
 	i2c_wr32(sd, CECICLR, MASK_CECTICLR | MASK_CECRICLR);
@@ -885,8 +3001,8 @@ static int tc358743_cec_adap_enable(struct cec_adapter *adap, bool enable)
 static int tc358743_cec_adap_monitor_all_enable(struct cec_adapter *adap,
 						bool enable)
 {
-	struct tc358743_state *state = adap->priv;
-	struct v4l2_subdev *sd = &state->sd;
+	struct tc358743_HOLD *tc3 = adap->priv;
+	struct v4l2_subdev *sd = &tc3->sd;
 	u32 reg;
 
 	reg = i2c_rd32(sd, CECRCTL1);
@@ -900,8 +3016,8 @@ static int tc358743_cec_adap_monitor_all_enable(struct cec_adapter *adap,
 
 static int tc358743_cec_adap_log_addr(struct cec_adapter *adap, u8 log_addr)
 {
-	struct tc358743_state *state = adap->priv;
-	struct v4l2_subdev *sd = &state->sd;
+	struct tc358743_HOLD *tc3 = adap->priv;
+	struct v4l2_subdev *sd = &tc3->sd;
 	unsigned int la = 0;
 
 	if (log_addr != CEC_LOG_ADDR_INVALID) {
@@ -915,8 +3031,8 @@ static int tc358743_cec_adap_log_addr(struct cec_adapter *adap, u8 log_addr)
 static int tc358743_cec_adap_transmit(struct cec_adapter *adap, u8 attempts,
 				   u32 signal_free_time, struct cec_msg *msg)
 {
-	struct tc358743_state *state = adap->priv;
-	struct v4l2_subdev *sd = &state->sd;
+	struct tc358743_HOLD *tc3 = adap->priv;
+	struct v4l2_subdev *sd = &tc3->sd;
 	unsigned int i;
 
 	i2c_wr32(sd, CECTCTL,
@@ -939,7 +3055,7 @@ static const struct cec_adap_ops tc358743_cec_adap_ops = {
 static void tc358743_cec_handler(struct v4l2_subdev *sd, u16 intstatus,
 				 bool *handled)
 {
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 	unsigned int cec_rxint, cec_txint;
 	unsigned int clr = 0;
 
@@ -954,20 +3070,20 @@ static void tc358743_cec_handler(struct v4l2_subdev *sd, u16 intstatus,
 
 	if ((intstatus & MASK_CEC_TINT) && cec_txint) {
 		if (cec_txint & MASK_CECTIEND)
-			cec_transmit_attempt_done(state->cec_adap,
+			cec_transmit_attempt_done(tc3->cec_adap,
 						  CEC_TX_STATUS_OK);
 		else if (cec_txint & MASK_CECTIAL)
-			cec_transmit_attempt_done(state->cec_adap,
+			cec_transmit_attempt_done(tc3->cec_adap,
 						  CEC_TX_STATUS_ARB_LOST);
 		else if (cec_txint & MASK_CECTIACK)
-			cec_transmit_attempt_done(state->cec_adap,
+			cec_transmit_attempt_done(tc3->cec_adap,
 						  CEC_TX_STATUS_NACK);
 		else if (cec_txint & MASK_CECTIUR) {
 			/*
 			 * Not sure when this bit is set. Treat
 			 * it as an error for now.
 			 */
-			cec_transmit_attempt_done(state->cec_adap,
+			cec_transmit_attempt_done(tc3->cec_adap,
 						  CEC_TX_STATUS_ERROR);
 		}
 		if (handled)
@@ -987,7 +3103,7 @@ static void tc358743_cec_handler(struct v4l2_subdev *sd, u16 intstatus,
 			v = i2c_rd32(sd, CECRBUF1 + i * 4);
 			msg.msg[i] = v & 0xff;
 		}
-		cec_received_msg(state->cec_adap, &msg);
+		cec_received_msg(tc3->cec_adap, &msg);
 		if (handled)
 			*handled = true;
 	}
@@ -1001,7 +3117,7 @@ static void tc358743_cec_handler(struct v4l2_subdev *sd, u16 intstatus,
 
 static void tc358743_format_change(struct v4l2_subdev *sd)
 {
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 	struct v4l2_dv_timings timings;
 	const struct v4l2_event tc358743_ev_fmt = {
 		.type = V4L2_EVENT_SOURCE_CHANGE,
@@ -1014,7 +3130,7 @@ static void tc358743_format_change(struct v4l2_subdev *sd)
 		v4l2_dbg(1, debug, sd, "%s: No signal\n",
 				__func__);
 	} else {
-		if (!v4l2_match_dv_timings(&state->timings, &timings, 0, false))
+		if (!v4l2_match_dv_timings(&tc3->timings, &timings, 0, false))
 			enable_stream(sd, false);
 
 		if (debug)
@@ -1189,7 +3305,7 @@ static void tc358743_hdmi_clk_int_handler(struct v4l2_subdev *sd, bool *handled)
 
 static void tc358743_hdmi_sys_int_handler(struct v4l2_subdev *sd, bool *handled)
 {
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 	u8 sys_int_mask = i2c_rd8(sd, SYS_INTM);
 	u8 sys_int = i2c_rd8(sd, SYS_INT) & ~sys_int_mask;
 
@@ -1208,7 +3324,7 @@ static void tc358743_hdmi_sys_int_handler(struct v4l2_subdev *sd, bool *handled)
 		} else {
 			tc358743_enable_interrupts(sd, false);
 			tc358743_disable_edid(sd);
-			memset(&state->timings, 0, sizeof(state->timings));
+			memset(&tc3->timings, 0, sizeof(tc3->timings));
 			tc358743_erase_bksv(sd);
 			tc358743_update_controls(sd);
 		}
@@ -1257,7 +3373,7 @@ static void tc358743_hdmi_sys_int_handler(struct v4l2_subdev *sd, bool *handled)
 
 static int tc358743_log_status(struct v4l2_subdev *sd)
 {
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 	struct v4l2_dv_timings timings;
 	uint8_t hdmi_sys_status =  i2c_rd8(sd, SYS_STATUS);
 	uint16_t sysctl = i2c_rd16(sd, SYSCTL);
@@ -1305,14 +3421,14 @@ static int tc358743_log_status(struct v4l2_subdev *sd)
 		v4l2_print_dv_timings(sd->name, "Detected format: ", &timings,
 				true);
 	}
-	v4l2_print_dv_timings(sd->name, "Configured format: ", &state->timings,
+	v4l2_print_dv_timings(sd->name, "Configured format: ", &tc3->timings,
 			true);
 
 	v4l2_info(sd, "-----CSI-TX status-----\n");
 	v4l2_info(sd, "Lanes needed: %d\n",
 			tc358743_num_csi_lanes_needed(sd));
 	v4l2_info(sd, "Lanes in use: %d\n",
-			state->csi_lanes_in_use);
+			tc3->csi_lanes_in_use);
 	v4l2_info(sd, "Waiting for particular sync signal: %s\n",
 			(i2c_rd16(sd, CSI_STATUS) & MASK_S_WSYNC) ?
 			"yes" : "no");
@@ -1326,9 +3442,9 @@ static int tc358743_log_status(struct v4l2_subdev *sd)
 			(i2c_rd16(sd, CSI_STATUS) & MASK_S_HLT) ?
 			"yes" : "no");
 	v4l2_info(sd, "Color space: %s\n",
-			state->mbus_fmt_code == MEDIA_BUS_FMT_UYVY8_1X16 ?
+			tc3->mbus_fmt_code == MEDIA_BUS_FMT_UYVY8_1X16 ?
 			"YCbCr 422 16-bit" :
-			state->mbus_fmt_code == MEDIA_BUS_FMT_RGB888_1X24 ?
+			tc3->mbus_fmt_code == MEDIA_BUS_FMT_RGB888_1X24 ?
 			"RGB 888 24-bit" : "Unsupported");
 
 	v4l2_info(sd, "-----%s status-----\n", is_hdmi(sd) ? "HDMI" : "DVI-D");
@@ -1481,35 +3597,35 @@ static int tc358743_isr(struct v4l2_subdev *sd, u32 status, bool *handled)
 
 static irqreturn_t tc358743_irq_handler(int irq, void *dev_id)
 {
-	struct tc358743_state *state = dev_id;
+	struct tc358743_HOLD *tc3 = dev_id;
 	bool handled = false;
 
-	tc358743_isr(&state->sd, 0, &handled);
+	tc358743_isr(&tc3->sd, 0, &handled);
 
 	return handled ? IRQ_HANDLED : IRQ_NONE;
 }
 
 static void tc358743_irq_poll_timer(struct timer_list *t)
 {
-	struct tc358743_state *state = from_timer(state, t, timer);
+	struct tc358743_HOLD *tc3 = from_timer(tc3, t, timer);
 	unsigned int msecs;
 
-	schedule_work(&state->work_i2c_poll);
+	schedule_work(&tc3->work_i2c_poll);
 	/*
 	 * If CEC is present, then we need to poll more frequently,
 	 * otherwise we will miss CEC messages.
 	 */
-	msecs = state->cec_adap ? POLL_INTERVAL_CEC_MS : POLL_INTERVAL_MS;
-	mod_timer(&state->timer, jiffies + msecs_to_jiffies(msecs));
+	msecs = tc3->cec_adap ? POLL_INTERVAL_CEC_MS : POLL_INTERVAL_MS;
+	mod_timer(&tc3->timer, jiffies + msecs_to_jiffies(msecs));
 }
 
 static void tc358743_work_i2c_poll(struct work_struct *work)
 {
-	struct tc358743_state *state = container_of(work,
-			struct tc358743_state, work_i2c_poll);
+	struct tc358743_HOLD *tc3 = container_of(work,
+			struct tc358743_HOLD, work_i2c_poll);
 	bool handled;
 
-	tc358743_isr(&state->sd, 0, &handled);
+	tc358743_isr(&tc3->sd, 0, &handled);
 }
 
 static int tc358743_subscribe_event(struct v4l2_subdev *sd, struct v4l2_fh *fh,
@@ -1541,7 +3657,7 @@ static int tc358743_g_input_status(struct v4l2_subdev *sd, u32 *status)
 static int tc358743_s_dv_timings(struct v4l2_subdev *sd,
 				 struct v4l2_dv_timings *timings)
 {
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 
 	if (!timings)
 		return -EINVAL;
@@ -1550,7 +3666,7 @@ static int tc358743_s_dv_timings(struct v4l2_subdev *sd,
 		v4l2_print_dv_timings(sd->name, "tc358743_s_dv_timings: ",
 				timings, false);
 
-	if (v4l2_match_dv_timings(&state->timings, timings, 0, false)) {
+	if (v4l2_match_dv_timings(&tc3->timings, timings, 0, false)) {
 		v4l2_dbg(1, debug, sd, "%s: no change\n", __func__);
 		return 0;
 	}
@@ -1561,7 +3677,7 @@ static int tc358743_s_dv_timings(struct v4l2_subdev *sd,
 		return -ERANGE;
 	}
 
-	state->timings = *timings;
+	tc3->timings = *timings;
 
 	enable_stream(sd, false);
 	tc358743_set_pll(sd);
@@ -1573,9 +3689,9 @@ static int tc358743_s_dv_timings(struct v4l2_subdev *sd,
 static int tc358743_g_dv_timings(struct v4l2_subdev *sd,
 				 struct v4l2_dv_timings *timings)
 {
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 
-	*timings = state->timings;
+	*timings = tc3->timings;
 
 	return 0;
 }
@@ -1627,13 +3743,13 @@ static int tc358743_get_mbus_config(struct v4l2_subdev *sd,
 				    unsigned int pad,
 				    struct v4l2_mbus_config *cfg)
 {
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 
 	cfg->type = V4L2_MBUS_CSI2_DPHY;
 
 	/* Support for non-continuous CSI-2 clock is missing in the driver */
 	cfg->bus.mipi_csi2.flags = 0;
-	cfg->bus.mipi_csi2.num_data_lanes = state->csi_lanes_in_use;
+	cfg->bus.mipi_csi2.num_data_lanes = tc3->csi_lanes_in_use;
 
 	return 0;
 }
@@ -1642,7 +3758,7 @@ static int tc358743_s_stream(struct v4l2_subdev *sd, int enable)
 {
 	enable_stream(sd, enable);
 	if (!enable) {
-		/* Put all lanes in LP-11 state (STOPSTATE) */
+		/* Put all lanes in LP-11 tc3 (STOPSTATE) */
 		tc358743_set_csi(sd);
 	}
 
@@ -1652,7 +3768,7 @@ static int tc358743_s_stream(struct v4l2_subdev *sd, int enable)
 /* --------------- PAD OPS --------------- */
 
 static int tc358743_enum_mbus_code(struct v4l2_subdev *sd,
-		struct v4l2_subdev_state *sd_state,
+		struct v4l2_subdev_HOLD *sd_tc3,
 		struct v4l2_subdev_mbus_code_enum *code)
 {
 	switch (code->index) {
@@ -1681,17 +3797,17 @@ static u32 tc358743_g_colorspace(u32 code)
 }
 
 static int tc358743_get_fmt(struct v4l2_subdev *sd,
-		struct v4l2_subdev_state *sd_state,
+		struct v4l2_subdev_HOLD *sd_tc3,
 		struct v4l2_subdev_format *format)
 {
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 
 	if (format->pad != 0)
 		return -EINVAL;
 
-	format->format.code = state->mbus_fmt_code;
-	format->format.width = state->timings.bt.width;
-	format->format.height = state->timings.bt.height;
+	format->format.code = tc3->mbus_fmt_code;
+	format->format.width = tc3->timings.bt.width;
+	format->format.height = tc3->timings.bt.height;
 	format->format.field = V4L2_FIELD_NONE;
 
 	format->format.colorspace = tc358743_g_colorspace(format->format.code);
@@ -1700,13 +3816,13 @@ static int tc358743_get_fmt(struct v4l2_subdev *sd,
 }
 
 static int tc358743_set_fmt(struct v4l2_subdev *sd,
-		struct v4l2_subdev_state *sd_state,
+		struct v4l2_subdev_HOLD *sd_tc3,
 		struct v4l2_subdev_format *format)
 {
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 
 	u32 code = format->format.code; /* is overwritten by get_fmt */
-	int ret = tc358743_get_fmt(sd, sd_state, format);
+	int ret = tc358743_get_fmt(sd, sd_tc3, format);
 
 	if (code == MEDIA_BUS_FMT_RGB888_1X24 ||
 	    code == MEDIA_BUS_FMT_UYVY8_1X16)
@@ -1719,7 +3835,7 @@ static int tc358743_set_fmt(struct v4l2_subdev *sd,
 	if (format->which == V4L2_SUBDEV_FORMAT_TRY)
 		return 0;
 
-	state->mbus_fmt_code = format->format.code;
+	tc3->mbus_fmt_code = format->format.code;
 
 	enable_stream(sd, false);
 	tc358743_set_pll(sd);
@@ -1732,7 +3848,7 @@ static int tc358743_set_fmt(struct v4l2_subdev *sd,
 static int tc358743_g_edid(struct v4l2_subdev *sd,
 		struct v4l2_subdev_edid *edid)
 {
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 
 	memset(edid->reserved, 0, sizeof(edid->reserved));
 
@@ -1740,19 +3856,19 @@ static int tc358743_g_edid(struct v4l2_subdev *sd,
 		return -EINVAL;
 
 	if (edid->start_block == 0 && edid->blocks == 0) {
-		edid->blocks = state->edid_blocks_written;
+		edid->blocks = tc3->edid_blocks_written;
 		return 0;
 	}
 
-	if (state->edid_blocks_written == 0)
+	if (tc3->edid_blocks_written == 0)
 		return -ENODATA;
 
-	if (edid->start_block >= state->edid_blocks_written ||
+	if (edid->start_block >= tc3->edid_blocks_written ||
 			edid->blocks == 0)
 		return -EINVAL;
 
-	if (edid->start_block + edid->blocks > state->edid_blocks_written)
-		edid->blocks = state->edid_blocks_written - edid->start_block;
+	if (edid->start_block + edid->blocks > tc3->edid_blocks_written)
+		edid->blocks = tc3->edid_blocks_written - edid->start_block;
 
 	i2c_rd(sd, EDID_RAM + (edid->start_block * EDID_BLOCK_SIZE), edid->edid,
 			edid->blocks * EDID_BLOCK_SIZE);
@@ -1763,7 +3879,7 @@ static int tc358743_g_edid(struct v4l2_subdev *sd,
 static int tc358743_s_edid(struct v4l2_subdev *sd,
 				struct v4l2_subdev_edid *edid)
 {
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 	u16 edid_len = edid->blocks * EDID_BLOCK_SIZE;
 	u16 pa;
 	int err;
@@ -1789,7 +3905,7 @@ static int tc358743_s_edid(struct v4l2_subdev *sd,
 	if (err)
 		return err;
 
-	cec_phys_addr_invalidate(state->cec_adap);
+	cec_phys_addr_invalidate(tc3->cec_adap);
 
 	tc358743_disable_edid(sd);
 
@@ -1797,16 +3913,16 @@ static int tc358743_s_edid(struct v4l2_subdev *sd,
 	i2c_wr8(sd, EDID_LEN2, edid_len >> 8);
 
 	if (edid->blocks == 0) {
-		state->edid_blocks_written = 0;
+		tc3->edid_blocks_written = 0;
 		return 0;
 	}
 
 	for (i = 0; i < edid_len; i += EDID_BLOCK_SIZE)
 		i2c_wr(sd, EDID_RAM + i, edid->edid + i, EDID_BLOCK_SIZE);
 
-	state->edid_blocks_written = edid->blocks;
+	tc3->edid_blocks_written = edid->blocks;
 
-	cec_s_phys_addr(state->cec_adap, pa, false);
+	cec_s_phys_addr(tc3->cec_adap, pa, false);
 
 	if (tx_5v_power_present(sd))
 		tc358743_enable_edid(sd);
@@ -1879,18 +3995,18 @@ static const struct v4l2_ctrl_config tc358743_ctrl_audio_present = {
 /* --------------- PROBE / REMOVE --------------- */
 
 #ifdef CONFIG_OF
-static void tc358743_gpio_reset(struct tc358743_state *state)
+static void tc358743_gpio_reset(struct tc358743_HOLD *tc3)
 {
 	usleep_range(5000, 10000);
-	gpiod_set_value(state->reset_gpio, 1);
+	gpiod_set_value(tc3->reset_gpio, 1);
 	usleep_range(1000, 2000);
-	gpiod_set_value(state->reset_gpio, 0);
+	gpiod_set_value(tc3->reset_gpio, 0);
 	msleep(20);
 }
 
-static int tc358743_probe_of(struct tc358743_state *state)
+static int tc358743_probe_of(struct tc358743_HOLD *tc3)
 {
-	struct device *dev = &state->i2c_client->dev;
+	struct device *dev = &tc3->i2c_client->dev;
 	struct v4l2_fwnode_endpoint endpoint = { .bus_type = 0 };
 	struct device_node *ep;
 	struct clk *refclk;
@@ -1928,7 +4044,7 @@ static int tc358743_probe_of(struct tc358743_state *state)
 		goto free_endpoint;
 	}
 
-	state->bus = endpoint.bus.mipi_csi2;
+	tc3->bus = endpoint.bus.mipi_csi2;
 
 	ret = clk_prepare_enable(refclk);
 	if (ret) {
@@ -1936,24 +4052,24 @@ static int tc358743_probe_of(struct tc358743_state *state)
 		goto free_endpoint;
 	}
 
-	state->pdata.refclk_hz = clk_get_rate(refclk);
-	state->pdata.ddc5v_delay = DDC5V_DELAY_100_MS;
-	state->pdata.enable_hdcp = false;
+	tc3->pdata.refclk_hz = clk_get_rate(refclk);
+	tc3->pdata.ddc5v_delay = DDC5V_DELAY_100_MS;
+	tc3->pdata.enable_hdcp = false;
 	/* A FIFO level of 16 should be enough for 2-lane 720p60 at 594 MHz. */
-	state->pdata.fifo_level = 374;
+	tc3->pdata.fifo_level = 374;
 	/*
 	 * The PLL input clock is obtained by dividing refclk by pll_prd.
 	 * It must be between 6 MHz and 40 MHz, lower frequency is better.
 	 */
-	switch (state->pdata.refclk_hz) {
+	switch (tc3->pdata.refclk_hz) {
 	case 26000000:
 	case 27000000:
 	case 42000000:
-		state->pdata.pll_prd = state->pdata.refclk_hz / 6000000;
+		tc3->pdata.pll_prd = tc3->pdata.refclk_hz / 6000000;
 		break;
 	default:
 		dev_err(dev, "unsupported refclk rate: %u Hz\n",
-			state->pdata.refclk_hz);
+			tc3->pdata.refclk_hz);
 		goto disable_clk;
 	}
 
@@ -1970,8 +4086,8 @@ static int tc358743_probe_of(struct tc358743_state *state)
 	}
 
 	/* The CSI speed per lane is refclk / pll_prd * pll_fbd */
-	state->pdata.pll_fbd = bps_pr_lane /
-			       state->pdata.refclk_hz * state->pdata.pll_prd;
+	tc3->pdata.pll_fbd = bps_pr_lane /
+			       tc3->pdata.refclk_hz * tc3->pdata.pll_prd;
 
 	/*
 	 * FIXME: These timings are from REF_02 for 594 or 972 Mbps per lane
@@ -1984,43 +4100,43 @@ static int tc358743_probe_of(struct tc358743_state *state)
 		dev_warn(dev, "untested bps per lane: %u bps\n", bps_pr_lane);
 		fallthrough;
 	case 594000000U:
-		state->pdata.lineinitcnt = 0xe80;
-		state->pdata.lptxtimecnt = 0x003;
+		tc3->pdata.lineinitcnt = 0xe80;
+		tc3->pdata.lptxtimecnt = 0x003;
 		/* tclk-preparecnt: 3, tclk-zerocnt: 20 */
-		state->pdata.tclk_headercnt = 0x1403;
-		state->pdata.tclk_trailcnt = 0x00;
+		tc3->pdata.tclk_headercnt = 0x1403;
+		tc3->pdata.tclk_trailcnt = 0x00;
 		/* ths-preparecnt: 3, ths-zerocnt: 1 */
-		state->pdata.ths_headercnt = 0x0103;
-		state->pdata.twakeup = 0x4882;
-		state->pdata.tclk_postcnt = 0x008;
-		state->pdata.ths_trailcnt = 0x2;
-		state->pdata.hstxvregcnt = 0;
+		tc3->pdata.ths_headercnt = 0x0103;
+		tc3->pdata.twakeup = 0x4882;
+		tc3->pdata.tclk_postcnt = 0x008;
+		tc3->pdata.ths_trailcnt = 0x2;
+		tc3->pdata.hstxvregcnt = 0;
 		break;
 	case 972000000U:
-		state->pdata.lineinitcnt = 0x1b58;
-		state->pdata.lptxtimecnt = 0x007;
+		tc3->pdata.lineinitcnt = 0x1b58;
+		tc3->pdata.lptxtimecnt = 0x007;
 		/* tclk-preparecnt: 6, tclk-zerocnt: 40 */
-		state->pdata.tclk_headercnt = 0x2806;
-		state->pdata.tclk_trailcnt = 0x00;
+		tc3->pdata.tclk_headercnt = 0x2806;
+		tc3->pdata.tclk_trailcnt = 0x00;
 		/* ths-preparecnt: 6, ths-zerocnt: 8 */
-		state->pdata.ths_headercnt = 0x0806;
-		state->pdata.twakeup = 0x4268;
-		state->pdata.tclk_postcnt = 0x008;
-		state->pdata.ths_trailcnt = 0x5;
-		state->pdata.hstxvregcnt = 0;
+		tc3->pdata.ths_headercnt = 0x0806;
+		tc3->pdata.twakeup = 0x4268;
+		tc3->pdata.tclk_postcnt = 0x008;
+		tc3->pdata.ths_trailcnt = 0x5;
+		tc3->pdata.hstxvregcnt = 0;
 		break;
 	}
 
-	state->reset_gpio = devm_gpiod_get_optional(dev, "reset",
+	tc3->reset_gpio = devm_gpiod_get_optional(dev, "reset",
 						    GPIOD_OUT_LOW);
-	if (IS_ERR(state->reset_gpio)) {
+	if (IS_ERR(tc3->reset_gpio)) {
 		dev_err(dev, "failed to get reset gpio\n");
-		ret = PTR_ERR(state->reset_gpio);
+		ret = PTR_ERR(tc3->reset_gpio);
 		goto disable_clk;
 	}
 
-	if (state->reset_gpio)
-		tc358743_gpio_reset(state);
+	if (tc3->reset_gpio)
+		tc358743_gpio_reset(tc3);
 
 	ret = 0;
 	goto free_endpoint;
@@ -2034,7 +4150,7 @@ put_node:
 	return ret;
 }
 #else
-static inline int tc358743_probe_of(struct tc358743_state *state)
+static inline int tc358743_probe_of(struct tc358743_HOLD *tc3)
 {
 	return -ENODEV;
 }
@@ -2044,7 +4160,7 @@ static int tc358743_probe(struct i2c_client *client)
 {
 	static struct v4l2_dv_timings default_timing =
 		V4L2_DV_BT_CEA_640X480P59_94;
-	struct tc358743_state *state;
+	struct tc358743_HOLD *tc3;
 	struct tc358743_platform_data *pdata = client->dev.platform_data;
 	struct v4l2_subdev *sd;
 	u16 irq_mask = MASK_HDMI_MSK | MASK_CSI_MSK;
@@ -2056,26 +4172,26 @@ static int tc358743_probe(struct i2c_client *client)
 	v4l_dbg(1, debug, client, "chip found @ 0x%x (%s)\n",
 		client->addr << 1, client->adapter->name);
 
-	state = devm_kzalloc(&client->dev, sizeof(struct tc358743_state),
+	tc3 = devm_kzalloc(&client->dev, sizeof(struct tc358743_HOLD),
 			GFP_KERNEL);
-	if (!state)
+	if (!tc3)
 		return -ENOMEM;
 
-	state->i2c_client = client;
+	tc3->i2c_client = client;
 
 	/* platform data */
 	if (pdata) {
-		state->pdata = *pdata;
-		state->bus.flags = 0;
+		tc3->pdata = *pdata;
+		tc3->bus.flags = 0;
 	} else {
-		err = tc358743_probe_of(state);
+		err = tc358743_probe_of(tc3);
 		if (err == -ENODEV)
 			v4l_err(client, "No platform data!\n");
 		if (err)
 			return err;
 	}
 
-	sd = &state->sd;
+	sd = &tc3->sd;
 	v4l2_i2c_subdev_init(sd, client, &tc358743_ops);
 	sd->flags |= V4L2_SUBDEV_FL_HAS_DEVNODE | V4L2_SUBDEV_FL_HAS_EVENTS;
 
@@ -2088,21 +4204,21 @@ static int tc358743_probe(struct i2c_client *client)
 	}
 
 	/* control handlers */
-	v4l2_ctrl_handler_init(&state->hdl, 3);
+	v4l2_ctrl_handler_init(&tc3->hdl, 3);
 
-	state->detect_tx_5v_ctrl = v4l2_ctrl_new_std(&state->hdl, NULL,
+	tc3->detect_tx_5v_ctrl = v4l2_ctrl_new_std(&tc3->hdl, NULL,
 			V4L2_CID_DV_RX_POWER_PRESENT, 0, 1, 0, 0);
 
 	/* custom controls */
-	state->audio_sampling_rate_ctrl = v4l2_ctrl_new_custom(&state->hdl,
+	tc3->audio_sampling_rate_ctrl = v4l2_ctrl_new_custom(&tc3->hdl,
 			&tc358743_ctrl_audio_sampling_rate, NULL);
 
-	state->audio_present_ctrl = v4l2_ctrl_new_custom(&state->hdl,
+	tc3->audio_present_ctrl = v4l2_ctrl_new_custom(&tc3->hdl,
 			&tc358743_ctrl_audio_present, NULL);
 
-	sd->ctrl_handler = &state->hdl;
-	if (state->hdl.error) {
-		err = state->hdl.error;
+	sd->ctrl_handler = &tc3->hdl;
+	if (tc3->hdl.error) {
+		err = tc3->hdl.error;
 		goto err_hdl;
 	}
 
@@ -2111,27 +4227,27 @@ static int tc358743_probe(struct i2c_client *client)
 		goto err_hdl;
 	}
 
-	state->pad.flags = MEDIA_PAD_FL_SOURCE;
+	tc3->pad.flags = MEDIA_PAD_FL_SOURCE;
 	sd->entity.function = MEDIA_ENT_F_VID_IF_BRIDGE;
-	err = media_entity_pads_init(&sd->entity, 1, &state->pad);
+	err = media_entity_pads_init(&sd->entity, 1, &tc3->pad);
 	if (err < 0)
 		goto err_hdl;
 
-	state->mbus_fmt_code = MEDIA_BUS_FMT_RGB888_1X24;
+	tc3->mbus_fmt_code = MEDIA_BUS_FMT_RGB888_1X24;
 
 	sd->dev = &client->dev;
 
-	mutex_init(&state->confctl_mutex);
+	mutex_init(&tc3->confctl_mutex);
 
-	INIT_DELAYED_WORK(&state->delayed_work_enable_hotplug,
+	INIT_DELAYED_WORK(&tc3->delayed_work_enable_hotplug,
 			tc358743_delayed_work_enable_hotplug);
 
 #ifdef CONFIG_VIDEO_TC358743_CEC
-	state->cec_adap = cec_allocate_adapter(&tc358743_cec_adap_ops,
-		state, dev_name(&client->dev),
+	tc3->cec_adap = cec_allocate_adapter(&tc358743_cec_adap_ops,
+		tc3, dev_name(&client->dev),
 		CEC_CAP_DEFAULTS | CEC_CAP_MONITOR_ALL, CEC_MAX_LOG_ADDRS);
-	if (IS_ERR(state->cec_adap)) {
-		err = PTR_ERR(state->cec_adap);
+	if (IS_ERR(tc3->cec_adap)) {
+		err = PTR_ERR(tc3->cec_adap);
 		goto err_hdl;
 	}
 	irq_mask |= MASK_CEC_RMSK | MASK_CEC_TMSK;
@@ -2145,28 +4261,28 @@ static int tc358743_probe(struct i2c_client *client)
 
 	tc358743_init_interrupts(sd);
 
-	if (state->i2c_client->irq) {
+	if (tc3->i2c_client->irq) {
 		err = devm_request_threaded_irq(&client->dev,
-						state->i2c_client->irq,
+						tc3->i2c_client->irq,
 						NULL, tc358743_irq_handler,
 						IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
-						"tc358743", state);
+						"tc358743", tc3);
 		if (err)
 			goto err_work_queues;
 	} else {
-		INIT_WORK(&state->work_i2c_poll,
+		INIT_WORK(&tc3->work_i2c_poll,
 			  tc358743_work_i2c_poll);
-		timer_setup(&state->timer, tc358743_irq_poll_timer, 0);
-		state->timer.expires = jiffies +
+		timer_setup(&tc3->timer, tc358743_irq_poll_timer, 0);
+		tc3->timer.expires = jiffies +
 				       msecs_to_jiffies(POLL_INTERVAL_MS);
-		add_timer(&state->timer);
+		add_timer(&tc3->timer);
 	}
 
-	err = cec_register_adapter(state->cec_adap, &client->dev);
+	err = cec_register_adapter(tc3->cec_adap, &client->dev);
 	if (err < 0) {
 		pr_err("%s: failed to register the cec device\n", __func__);
-		cec_delete_adapter(state->cec_adap);
-		state->cec_adap = NULL;
+		cec_delete_adapter(tc3->cec_adap);
+		tc3->cec_adap = NULL;
 		goto err_work_queues;
 	}
 
@@ -2187,33 +4303,33 @@ static int tc358743_probe(struct i2c_client *client)
 	return 0;
 
 err_work_queues:
-	cec_unregister_adapter(state->cec_adap);
-	if (!state->i2c_client->irq)
-		flush_work(&state->work_i2c_poll);
-	cancel_delayed_work(&state->delayed_work_enable_hotplug);
-	mutex_destroy(&state->confctl_mutex);
+	cec_unregister_adapter(tc3->cec_adap);
+	if (!tc3->i2c_client->irq)
+		flush_work(&tc3->work_i2c_poll);
+	cancel_delayed_work(&tc3->delayed_work_enable_hotplug);
+	mutex_destroy(&tc3->confctl_mutex);
 err_hdl:
 	media_entity_cleanup(&sd->entity);
-	v4l2_ctrl_handler_free(&state->hdl);
+	v4l2_ctrl_handler_free(&tc3->hdl);
 	return err;
 }
 
 static void tc358743_remove(struct i2c_client *client)
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
-	struct tc358743_state *state = to_state(sd);
+	struct tc358743_HOLD *tc3 = to_tc3(sd);
 
-	if (!state->i2c_client->irq) {
-		del_timer_sync(&state->timer);
-		flush_work(&state->work_i2c_poll);
+	if (!tc3->i2c_client->irq) {
+		del_timer_sync(&tc3->timer);
+		flush_work(&tc3->work_i2c_poll);
 	}
-	cancel_delayed_work_sync(&state->delayed_work_enable_hotplug);
-	cec_unregister_adapter(state->cec_adap);
+	cancel_delayed_work_sync(&tc3->delayed_work_enable_hotplug);
+	cec_unregister_adapter(tc3->cec_adap);
 	v4l2_async_unregister_subdev(sd);
 	v4l2_device_unregister_subdev(sd);
-	mutex_destroy(&state->confctl_mutex);
+	mutex_destroy(&tc3->confctl_mutex);
 	media_entity_cleanup(&sd->entity);
-	v4l2_ctrl_handler_free(&state->hdl);
+	v4l2_ctrl_handler_free(&tc3->hdl);
 }
 
 static const struct i2c_device_id tc358743_id[] = {
