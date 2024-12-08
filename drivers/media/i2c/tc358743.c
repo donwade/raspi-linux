@@ -898,42 +898,10 @@ static inline void get_mode_table(unsigned int code,
 	}
 }
 
-/* Read registers up to 2 at a time */
-static int imx911_read_reg(struct imx911 *imx911, u16 reg, u32 len, u32 *val)
-{
-	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
-	struct i2c_msg msgs[2];
-	u8 addr_buf[2] = { reg >> 8, reg & 0xff };
-	u8 data_buf[4] = { 0, };
-	int ret;
-
-	if (len > 4)
-		return -EINVAL;
-
-	/* Write register address */
-	msgs[0].addr = client->addr;
-	msgs[0].flags = 0;
-	msgs[0].len = ARRAY_SIZE(addr_buf);
-	msgs[0].buf = addr_buf;
-
-	/* Read data from register */
-	msgs[1].addr = client->addr;
-	msgs[1].flags = I2C_M_RD;
-	msgs[1].len = len;
-	msgs[1].buf = &data_buf[4 - len];
-
-	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
-	if (ret != ARRAY_SIZE(msgs))
-		return -EIO;
-
-	*val = get_unaligned_be32(data_buf);
-
-	return 0;
-}
-
 /* Write registers up to 2 at a time */
 static int imx911_write_reg(struct imx911 *imx911, u16 reg, u32 len, u32 val)
 {
+#if 0
 	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
 	u8 buf[6];
 
@@ -944,30 +912,7 @@ static int imx911_write_reg(struct imx911 *imx911, u16 reg, u32 len, u32 val)
 	put_unaligned_be32(val << (8 * (4 - len)), buf + 2);
 	if (i2c_master_send(client, buf, len + 2) != len + 2)
 		return -EIO;
-
-	return 0;
-}
-
-/* Write a list of registers */
-static int imx911_write_regs(struct imx911 *imx911,
-			     const struct imx911_reg *regs, u32 len)
-{
-	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
-	unsigned int i;
-
-	for (i = 0; i < len; i++) {
-		int ret;
-
-		ret = imx911_write_reg(imx911, regs[i].address, 1, regs[i].val);
-		if (ret) {
-			dev_err_ratelimited(&client->dev,
-					    "Failed to write reg 0x%4.4x. error = %d\n",
-					    regs[i].address, ret);
-
-			return ret;
-		}
-	}
-
+#endif
 	return 0;
 }
 
@@ -1474,106 +1419,9 @@ static int imx911_get_selection(struct v4l2_subdev *sd,
 	return -EINVAL;
 }
 
-/* Start streaming */
-static int imx911_start_streaming(struct imx911 *imx911)
-{
-	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
-	const struct imx911_reg_list *reg_list, *freq_regs;
-	int i, ret;
-	u32 val;
-
-	if (!imx911->common_regs_written) {
-		ret = imx911_write_regs(imx911, mode_common_regs,
-					ARRAY_SIZE(mode_common_regs));
-		if (ret) {
-			dev_err(&client->dev, "%s failed to set common settings\n",
-				__func__);
-			return ret;
-		}
-
-		ret = imx911_read_reg(imx911, IMX708_REG_BASE_SPC_GAINS_L,
-				      IMX708_REG_VALUE_08BIT, &val);
-		if (ret == 0 && val == 0x40) {
-			for (i = 0; i < 54 && ret == 0; i++) {
-				ret = imx911_write_reg(imx911,
-						       IMX708_REG_BASE_SPC_GAINS_L + i,
-						       IMX708_REG_VALUE_08BIT,
-						       pdaf_gains[0][i % 9]);
-			}
-			for (i = 0; i < 54 && ret == 0; i++) {
-				ret = imx911_write_reg(imx911,
-						       IMX708_REG_BASE_SPC_GAINS_R + i,
-						       IMX708_REG_VALUE_08BIT,
-						       pdaf_gains[1][i % 9]);
-			}
-		}
-		if (ret) {
-			dev_err(&client->dev, "%s failed to set PDAF gains\n",
-				__func__);
-			return ret;
-		}
-
-		imx911->common_regs_written = true;
-	}
-
-	/* Apply default values of current mode */
-	reg_list = &imx911->mode->reg_list;
-	ret = imx911_write_regs(imx911, reg_list->regs, reg_list->num_of_regs);
-	if (ret) {
-		dev_err(&client->dev, "%s failed to set mode\n", __func__);
-		return ret;
-	}
-
-	/* Update the link frequency registers */
-	freq_regs = &link_freq_regs[imx911->link_freq_idx];
-	ret = imx911_write_regs(imx911, freq_regs->regs,
-				freq_regs->num_of_regs);
-	if (ret) {
-		dev_err(&client->dev, "%s failed to set link frequency registers\n",
-			__func__);
-		return ret;
-	}
-
-	/* Quad Bayer re-mosaic adjustments (for full-resolution mode only) */
-	if (imx911->mode->remosaic && qbc_adjust > 0) {
-		imx911_write_reg(imx911, IMX708_LPF_INTENSITY,
-				 IMX708_REG_VALUE_08BIT, qbc_adjust);
-		imx911_write_reg(imx911,
-				 IMX708_LPF_INTENSITY_EN,
-				 IMX708_REG_VALUE_08BIT,
-				 IMX708_LPF_INTENSITY_ENABLED);
-	} else {
-		imx911_write_reg(imx911,
-				 IMX708_LPF_INTENSITY_EN,
-				 IMX708_REG_VALUE_08BIT,
-				 IMX708_LPF_INTENSITY_DISABLED);
-	}
-
-	/* Apply customized values from user */
-	ret =  __v4l2_ctrl_handler_setup(imx911->sd.ctrl_handler);
-	if (ret)
-		return ret;
-
-	/* set stream on register */
-	return imx911_write_reg(imx911, IMX708_REG_MODE_SELECT,
-				IMX708_REG_VALUE_08BIT, IMX708_MODE_STREAMING);
-}
-
-/* Stop streaming */
-static void imx911_stop_streaming(struct imx911 *imx911)
-{
-	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
-	int ret;
-
-	/* set stream off register */
-	ret = imx911_write_reg(imx911, IMX708_REG_MODE_SELECT,
-			       IMX708_REG_VALUE_08BIT, IMX708_MODE_STANDBY);
-	if (ret)
-		dev_err(&client->dev, "%s failed to set stream\n", __func__);
-}
-
 static int imx911_set_stream(struct v4l2_subdev *sd, int enable)
 {
+#if 0
 	struct imx911 *imx911 = to_imx911(sd);
 	struct i2c_client *client = v4l2_get_subdevdata(sd);
 	int ret = 0;
@@ -1620,11 +1468,14 @@ err_unlock:
 	mutex_unlock(&imx911->mutex);
 
 	return ret;
+#endif
+    return 0;
 }
 
 /* Power/clock management functions */
 static int imx911_power_on(struct device *dev)
 {
+#if 0
 	struct i2c_client *client = to_i2c_client(dev);
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx911 *imx911 = to_imx911(sd);
@@ -1655,10 +1506,13 @@ reg_off:
 	regulator_bulk_disable(ARRAY_SIZE(imx911_supply_name),
 			       imx911->supplies);
 	return ret;
+#endif
+    return 0;
 }
 
 static int imx911_power_off(struct device *dev)
 {
+#if 0
 	struct i2c_client *client = to_i2c_client(dev);
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx911 *imx911 = to_imx911(sd);
@@ -1670,24 +1524,26 @@ static int imx911_power_off(struct device *dev)
 
 	/* Force reprogramming of the common registers when powered up again. */
 	imx911->common_regs_written = false;
-
+#endif
 	return 0;
 }
 
 static int __maybe_unused imx911_suspend(struct device *dev)
 {
+#if 0
 	struct i2c_client *client = to_i2c_client(dev);
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx911 *imx911 = to_imx911(sd);
 
 	if (imx911->streaming)
 		imx911_stop_streaming(imx911);
-
+#endif
 	return 0;
 }
 
 static int __maybe_unused imx911_resume(struct device *dev)
 {
+#if 0
 	struct i2c_client *client = to_i2c_client(dev);
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx911 *imx911 = to_imx911(sd);
@@ -1705,10 +1561,13 @@ error:
 	imx911_stop_streaming(imx911);
 	imx911->streaming = 0;
 	return ret;
+#endif
+    return 0;
 }
 
 static int imx911_get_regulators(struct imx911 *imx911)
 {
+#if 0
 	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
 	unsigned int i;
 
@@ -1718,11 +1577,14 @@ static int imx911_get_regulators(struct imx911 *imx911)
 	return devm_regulator_bulk_get(&client->dev,
 				       ARRAY_SIZE(imx911_supply_name),
 				       imx911->supplies);
+#endif
+    return 0;
 }
 
 /* Verify chip ID */
 static int imx911_identify_module(struct imx911 *imx911)
 {
+#if 0
 	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
 	int ret;
 	u32 val;
@@ -1748,7 +1610,7 @@ static int imx911_identify_module(struct imx911 *imx911)
 			 val & 0x02 ? "_wide" : "",
 			 val & 0x80 ? "_noir" : "");
 	}
-
+#endif
 	return 0;
 }
 
@@ -2075,6 +1937,7 @@ error_power_off:
 
 static void imx911_remove(struct i2c_client *client)
 {
+#if 0
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx911 *imx911 = to_imx911(sd);
 
@@ -2086,6 +1949,7 @@ static void imx911_remove(struct i2c_client *client)
 	if (!pm_runtime_status_suspended(&client->dev))
 		imx911_power_off(&client->dev);
 	pm_runtime_set_suspended(&client->dev);
+#endif
 }
 
 static const struct of_device_id imx911_dt_ids[] = {
@@ -2099,6 +1963,7 @@ static const struct dev_pm_ops imx911_pm_ops = {
 	SET_RUNTIME_PM_OPS(imx911_power_off, imx911_power_on, NULL)
 };
 
+#if 0
 static struct i2c_driver imx911_i2c_driver = {
 	.driver = {
 		.name = "imx911",
@@ -2114,6 +1979,13 @@ module_i2c_driver(imx911_i2c_driver);
 MODULE_AUTHOR("David Plowman <david.plowman@raspberrypi.com>");
 MODULE_DESCRIPTION("Sony IMX708 sensor driver");
 MODULE_LICENSE("GPL v2");
+#endif
+
+
+///////////////////////////////////////////////
+///////////////////////////////////////////////
+///////////////////////////////////////////////
+
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * tc358743 - Toshiba HDMI to CSI-2 bridge
@@ -2183,7 +2055,7 @@ static const struct v4l2_dv_timings_cap tc358743_timings_cap = {
 			V4L2_DV_BT_CAP_CUSTOM)
 };
 
-struct tc358743_HOLD {
+struct tc358743_state {
 	struct tc358743_platform_data pdata;
 	struct v4l2_mbus_config_mipi_csi2 bus;
 	struct v4l2_subdev sd;
@@ -2219,16 +2091,16 @@ static void tc358743_enable_interrupts(struct v4l2_subdev *sd,
 		bool cable_connected);
 static int tc358743_s_ctrl_detect_tx_5v(struct v4l2_subdev *sd);
 
-static inline struct tc358743_HOLD *to_tc3(struct v4l2_subdev *sd)
+static inline struct tc358743_state *to_tc3(struct v4l2_subdev *sd)
 {
-	return container_of(sd, struct tc358743_HOLD, sd);
+	return container_of(sd, struct tc358743_state, sd);
 }
 
 /* --------------- I2C --------------- */
 
 static int i2c_rd(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 	struct i2c_client *client = tc3->i2c_client;
 	int err;
 	u8 buf[2] = { reg >> 8, reg & 0xff };
@@ -2257,7 +2129,7 @@ static int i2c_rd(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
 
 static void i2c_wr(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 	struct i2c_client *client = tc3->i2c_client;
 	int err, i;
 	struct i2c_msg msg;
@@ -2489,8 +2361,8 @@ static int tc358743_get_detected_timings(struct v4l2_subdev *sd,
 static void tc358743_delayed_work_enable_hotplug(struct work_struct *work)
 {
 	struct delayed_work *dwork = to_delayed_work(work);
-	struct tc358743_HOLD *tc3 = container_of(dwork,
-			struct tc358743_HOLD, delayed_work_enable_hotplug);
+	struct tc358743_state *tc3 = container_of(dwork,
+			struct tc358743_state, delayed_work_enable_hotplug);
 	struct v4l2_subdev *sd = &tc3->sd;
 
 	v4l2_dbg(2, debug, sd, "%s:\n", __func__);
@@ -2522,7 +2394,7 @@ static void tc358743_set_hdmi_hdcp(struct v4l2_subdev *sd, bool enable)
 
 static void tc358743_disable_edid(struct v4l2_subdev *sd)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 
 	v4l2_dbg(2, debug, sd, "%s:\n", __func__);
 
@@ -2535,7 +2407,7 @@ static void tc358743_disable_edid(struct v4l2_subdev *sd)
 
 static void tc358743_enable_edid(struct v4l2_subdev *sd)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 
 	if (tc3->edid_blocks_written == 0) {
 		v4l2_dbg(2, debug, sd, "%s: no EDID -> no hotplug\n", __func__);
@@ -2589,7 +2461,7 @@ static void print_avi_infoframe(struct v4l2_subdev *sd)
 
 static int tc358743_s_ctrl_detect_tx_5v(struct v4l2_subdev *sd)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 
 	return v4l2_ctrl_s_ctrl(tc3->detect_tx_5v_ctrl,
 			tx_5v_power_present(sd));
@@ -2597,7 +2469,7 @@ static int tc358743_s_ctrl_detect_tx_5v(struct v4l2_subdev *sd)
 
 static int tc358743_s_ctrl_audio_sampling_rate(struct v4l2_subdev *sd)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 
 	return v4l2_ctrl_s_ctrl(tc3->audio_sampling_rate_ctrl,
 			get_audio_sampling_rate(sd));
@@ -2605,7 +2477,7 @@ static int tc358743_s_ctrl_audio_sampling_rate(struct v4l2_subdev *sd)
 
 static int tc358743_s_ctrl_audio_present(struct v4l2_subdev *sd)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 
 	return v4l2_ctrl_s_ctrl(tc3->audio_present_ctrl,
 			audio_present(sd));
@@ -2648,7 +2520,7 @@ static inline void tc358743_sleep_mode(struct v4l2_subdev *sd, bool enable)
 
 static inline void enable_stream(struct v4l2_subdev *sd, bool enable)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 
 	v4l2_dbg(3, debug, sd, "%s: %sable\n",
 			__func__, enable ? "en" : "dis");
@@ -2676,7 +2548,7 @@ static inline void enable_stream(struct v4l2_subdev *sd, bool enable)
 
 static void tc358743_set_pll(struct v4l2_subdev *sd)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 	struct tc358743_platform_data *pdata = &tc3->pdata;
 	u16 pllctl0 = i2c_rd16(sd, PLLCTL0);
 	u16 pllctl1 = i2c_rd16(sd, PLLCTL1);
@@ -2715,7 +2587,7 @@ static void tc358743_set_pll(struct v4l2_subdev *sd)
 
 static void tc358743_set_ref_clk(struct v4l2_subdev *sd)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 	struct tc358743_platform_data *pdata = &tc3->pdata;
 	u32 sys_freq;
 	u32 lockdet_ref;
@@ -2764,7 +2636,7 @@ static void tc358743_set_ref_clk(struct v4l2_subdev *sd)
 
 static void tc358743_set_csi_color_space(struct v4l2_subdev *sd)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 
 	switch (tc3->mbus_fmt_code) {
 	case MEDIA_BUS_FMT_UYVY8_1X16:
@@ -2798,7 +2670,7 @@ static void tc358743_set_csi_color_space(struct v4l2_subdev *sd)
 
 static unsigned tc358743_num_csi_lanes_needed(struct v4l2_subdev *sd)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 	struct v4l2_bt_timings *bt = &tc3->timings.bt;
 	struct tc358743_platform_data *pdata = &tc3->pdata;
 	u32 bits_pr_pixel =
@@ -2811,7 +2683,7 @@ static unsigned tc358743_num_csi_lanes_needed(struct v4l2_subdev *sd)
 
 static void tc358743_set_csi(struct v4l2_subdev *sd)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 	struct tc358743_platform_data *pdata = &tc3->pdata;
 	unsigned lanes = tc358743_num_csi_lanes_needed(sd);
 
@@ -2875,7 +2747,7 @@ static void tc358743_set_csi(struct v4l2_subdev *sd)
 
 static void tc358743_set_hdmi_phy(struct v4l2_subdev *sd)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 	struct tc358743_platform_data *pdata = &tc3->pdata;
 
 	/* Default settings from REF_02, sheet "Source HDMI"
@@ -2905,7 +2777,7 @@ static void tc358743_set_hdmi_phy(struct v4l2_subdev *sd)
 
 static void tc358743_set_hdmi_audio(struct v4l2_subdev *sd)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 
 	/* Default settings from REF_02, sheet "Source HDMI" */
 	i2c_wr8(sd, FORCE_MUTE, 0x00);
@@ -2945,7 +2817,7 @@ static void tc358743_set_hdmi_info_frame_mode(struct v4l2_subdev *sd)
 
 static void tc358743_initial_setup(struct v4l2_subdev *sd)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 	struct tc358743_platform_data *pdata = &tc3->pdata;
 
 	/*
@@ -2987,7 +2859,7 @@ static void tc358743_initial_setup(struct v4l2_subdev *sd)
 #ifdef CONFIG_VIDEO_TC358743_CEC
 static int tc358743_cec_adap_enable(struct cec_adapter *adap, bool enable)
 {
-	struct tc358743_HOLD *tc3 = adap->priv;
+	struct tc358743_state *tc3 = adap->priv;
 	struct v4l2_subdev *sd = &tc3->sd;
 
 	i2c_wr32(sd, CECIMSK, enable ? MASK_CECTIM | MASK_CECRIM : 0);
@@ -3001,7 +2873,7 @@ static int tc358743_cec_adap_enable(struct cec_adapter *adap, bool enable)
 static int tc358743_cec_adap_monitor_all_enable(struct cec_adapter *adap,
 						bool enable)
 {
-	struct tc358743_HOLD *tc3 = adap->priv;
+	struct tc358743_state *tc3 = adap->priv;
 	struct v4l2_subdev *sd = &tc3->sd;
 	u32 reg;
 
@@ -3016,7 +2888,7 @@ static int tc358743_cec_adap_monitor_all_enable(struct cec_adapter *adap,
 
 static int tc358743_cec_adap_log_addr(struct cec_adapter *adap, u8 log_addr)
 {
-	struct tc358743_HOLD *tc3 = adap->priv;
+	struct tc358743_state *tc3 = adap->priv;
 	struct v4l2_subdev *sd = &tc3->sd;
 	unsigned int la = 0;
 
@@ -3031,7 +2903,7 @@ static int tc358743_cec_adap_log_addr(struct cec_adapter *adap, u8 log_addr)
 static int tc358743_cec_adap_transmit(struct cec_adapter *adap, u8 attempts,
 				   u32 signal_free_time, struct cec_msg *msg)
 {
-	struct tc358743_HOLD *tc3 = adap->priv;
+	struct tc358743_state *tc3 = adap->priv;
 	struct v4l2_subdev *sd = &tc3->sd;
 	unsigned int i;
 
@@ -3055,7 +2927,7 @@ static const struct cec_adap_ops tc358743_cec_adap_ops = {
 static void tc358743_cec_handler(struct v4l2_subdev *sd, u16 intstatus,
 				 bool *handled)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 	unsigned int cec_rxint, cec_txint;
 	unsigned int clr = 0;
 
@@ -3117,7 +2989,7 @@ static void tc358743_cec_handler(struct v4l2_subdev *sd, u16 intstatus,
 
 static void tc358743_format_change(struct v4l2_subdev *sd)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 	struct v4l2_dv_timings timings;
 	const struct v4l2_event tc358743_ev_fmt = {
 		.type = V4L2_EVENT_SOURCE_CHANGE,
@@ -3305,7 +3177,7 @@ static void tc358743_hdmi_clk_int_handler(struct v4l2_subdev *sd, bool *handled)
 
 static void tc358743_hdmi_sys_int_handler(struct v4l2_subdev *sd, bool *handled)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 	u8 sys_int_mask = i2c_rd8(sd, SYS_INTM);
 	u8 sys_int = i2c_rd8(sd, SYS_INT) & ~sys_int_mask;
 
@@ -3373,7 +3245,7 @@ static void tc358743_hdmi_sys_int_handler(struct v4l2_subdev *sd, bool *handled)
 
 static int tc358743_log_status(struct v4l2_subdev *sd)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 	struct v4l2_dv_timings timings;
 	uint8_t hdmi_sys_status =  i2c_rd8(sd, SYS_STATUS);
 	uint16_t sysctl = i2c_rd16(sd, SYSCTL);
@@ -3597,7 +3469,7 @@ static int tc358743_isr(struct v4l2_subdev *sd, u32 status, bool *handled)
 
 static irqreturn_t tc358743_irq_handler(int irq, void *dev_id)
 {
-	struct tc358743_HOLD *tc3 = dev_id;
+	struct tc358743_state *tc3 = dev_id;
 	bool handled = false;
 
 	tc358743_isr(&tc3->sd, 0, &handled);
@@ -3607,7 +3479,7 @@ static irqreturn_t tc358743_irq_handler(int irq, void *dev_id)
 
 static void tc358743_irq_poll_timer(struct timer_list *t)
 {
-	struct tc358743_HOLD *tc3 = from_timer(tc3, t, timer);
+	struct tc358743_state *tc3 = from_timer(tc3, t, timer);
 	unsigned int msecs;
 
 	schedule_work(&tc3->work_i2c_poll);
@@ -3621,8 +3493,8 @@ static void tc358743_irq_poll_timer(struct timer_list *t)
 
 static void tc358743_work_i2c_poll(struct work_struct *work)
 {
-	struct tc358743_HOLD *tc3 = container_of(work,
-			struct tc358743_HOLD, work_i2c_poll);
+	struct tc358743_state *tc3 = container_of(work,
+			struct tc358743_state, work_i2c_poll);
 	bool handled;
 
 	tc358743_isr(&tc3->sd, 0, &handled);
@@ -3657,7 +3529,7 @@ static int tc358743_g_input_status(struct v4l2_subdev *sd, u32 *status)
 static int tc358743_s_dv_timings(struct v4l2_subdev *sd,
 				 struct v4l2_dv_timings *timings)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 
 	if (!timings)
 		return -EINVAL;
@@ -3689,7 +3561,7 @@ static int tc358743_s_dv_timings(struct v4l2_subdev *sd,
 static int tc358743_g_dv_timings(struct v4l2_subdev *sd,
 				 struct v4l2_dv_timings *timings)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 
 	*timings = tc3->timings;
 
@@ -3743,7 +3615,7 @@ static int tc358743_get_mbus_config(struct v4l2_subdev *sd,
 				    unsigned int pad,
 				    struct v4l2_mbus_config *cfg)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 
 	cfg->type = V4L2_MBUS_CSI2_DPHY;
 
@@ -3768,7 +3640,7 @@ static int tc358743_s_stream(struct v4l2_subdev *sd, int enable)
 /* --------------- PAD OPS --------------- */
 
 static int tc358743_enum_mbus_code(struct v4l2_subdev *sd,
-		struct v4l2_subdev_HOLD *sd_tc3,
+		struct v4l2_subdev_state *sd_tc3,
 		struct v4l2_subdev_mbus_code_enum *code)
 {
 	switch (code->index) {
@@ -3797,10 +3669,10 @@ static u32 tc358743_g_colorspace(u32 code)
 }
 
 static int tc358743_get_fmt(struct v4l2_subdev *sd,
-		struct v4l2_subdev_HOLD *sd_tc3,
+		struct v4l2_subdev_state *sd_tc3,
 		struct v4l2_subdev_format *format)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 
 	if (format->pad != 0)
 		return -EINVAL;
@@ -3816,10 +3688,10 @@ static int tc358743_get_fmt(struct v4l2_subdev *sd,
 }
 
 static int tc358743_set_fmt(struct v4l2_subdev *sd,
-		struct v4l2_subdev_HOLD *sd_tc3,
+		struct v4l2_subdev_state *sd_tc3,
 		struct v4l2_subdev_format *format)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 
 	u32 code = format->format.code; /* is overwritten by get_fmt */
 	int ret = tc358743_get_fmt(sd, sd_tc3, format);
@@ -3848,7 +3720,7 @@ static int tc358743_set_fmt(struct v4l2_subdev *sd,
 static int tc358743_g_edid(struct v4l2_subdev *sd,
 		struct v4l2_subdev_edid *edid)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 
 	memset(edid->reserved, 0, sizeof(edid->reserved));
 
@@ -3879,7 +3751,7 @@ static int tc358743_g_edid(struct v4l2_subdev *sd,
 static int tc358743_s_edid(struct v4l2_subdev *sd,
 				struct v4l2_subdev_edid *edid)
 {
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 	u16 edid_len = edid->blocks * EDID_BLOCK_SIZE;
 	u16 pa;
 	int err;
@@ -3995,7 +3867,7 @@ static const struct v4l2_ctrl_config tc358743_ctrl_audio_present = {
 /* --------------- PROBE / REMOVE --------------- */
 
 #ifdef CONFIG_OF
-static void tc358743_gpio_reset(struct tc358743_HOLD *tc3)
+static void tc358743_gpio_reset(struct tc358743_state *tc3)
 {
 	usleep_range(5000, 10000);
 	gpiod_set_value(tc3->reset_gpio, 1);
@@ -4004,7 +3876,7 @@ static void tc358743_gpio_reset(struct tc358743_HOLD *tc3)
 	msleep(20);
 }
 
-static int tc358743_probe_of(struct tc358743_HOLD *tc3)
+static int tc358743_probe_of(struct tc358743_state *tc3)
 {
 	struct device *dev = &tc3->i2c_client->dev;
 	struct v4l2_fwnode_endpoint endpoint = { .bus_type = 0 };
@@ -4150,7 +4022,7 @@ put_node:
 	return ret;
 }
 #else
-static inline int tc358743_probe_of(struct tc358743_HOLD *tc3)
+static inline int tc358743_probe_of(struct tc358743_state *tc3)
 {
 	return -ENODEV;
 }
@@ -4160,7 +4032,7 @@ static int tc358743_probe(struct i2c_client *client)
 {
 	static struct v4l2_dv_timings default_timing =
 		V4L2_DV_BT_CEA_640X480P59_94;
-	struct tc358743_HOLD *tc3;
+	struct tc358743_state *tc3;
 	struct tc358743_platform_data *pdata = client->dev.platform_data;
 	struct v4l2_subdev *sd;
 	u16 irq_mask = MASK_HDMI_MSK | MASK_CSI_MSK;
@@ -4172,7 +4044,7 @@ static int tc358743_probe(struct i2c_client *client)
 	v4l_dbg(1, debug, client, "chip found @ 0x%x (%s)\n",
 		client->addr << 1, client->adapter->name);
 
-	tc3 = devm_kzalloc(&client->dev, sizeof(struct tc358743_HOLD),
+	tc3 = devm_kzalloc(&client->dev, sizeof(struct tc358743_state),
 			GFP_KERNEL);
 	if (!tc3)
 		return -ENOMEM;
@@ -4317,7 +4189,7 @@ err_hdl:
 static void tc358743_remove(struct i2c_client *client)
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
-	struct tc358743_HOLD *tc3 = to_tc3(sd);
+	struct tc358743_state *tc3 = to_tc3(sd);
 
 	if (!tc3->i2c_client->irq) {
 		del_timer_sync(&tc3->timer);
@@ -4347,13 +4219,24 @@ static const struct of_device_id tc358743_of_match[] = {
 MODULE_DEVICE_TABLE(of, tc358743_of_match);
 #endif
 
+static int tc358743_double_probe(struct i2c_client *client)
+{
+    return ( imx911_probe(client) | tc358743_probe(client) );
+}
+
+static void tc358743_double_remove(struct i2c_client *client)
+{
+    imx911_remove(client);
+    tc358743_remove(client);
+}
+
 static struct i2c_driver tc358743_driver = {
 	.driver = {
 		.name = "tc358743",
 		.of_match_table = of_match_ptr(tc358743_of_match),
 	},
-	.probe = tc358743_probe,
-	.remove = tc358743_remove,
+	.probe = tc358743_double_probe,
+	.remove = tc358743_double_remove,
 	.id_table = tc358743_id,
 };
 
