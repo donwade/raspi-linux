@@ -836,7 +836,6 @@ struct imx911 {
 
 	struct v4l2_ctrl_handler ctrl_handler;
 	/* V4L2 Controls */
-	struct v4l2_ctrl *pixel_rate;
 	struct v4l2_ctrl *exposure;
 	struct v4l2_ctrl *vblank;
 	struct v4l2_ctrl *hblank;
@@ -1054,10 +1053,6 @@ static void imx911_set_framing_limits(struct imx911 *imx911)
 {
 	const struct imx911_mode *mode = imx911->mode;
 	unsigned int hblank;
-
-	__v4l2_ctrl_modify_range(imx911->pixel_rate,
-				 mode->pixel_rate, mode->pixel_rate,
-				 1, mode->pixel_rate);
 
 	/* Update limits and set FPS to default */
 	__v4l2_ctrl_modify_range(imx911->vblank, mode->vblank_min,
@@ -1565,55 +1560,6 @@ error:
     return 0;
 }
 
-static int imx911_get_regulators(struct imx911 *imx911)
-{
-#if 0
-	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(imx911_supply_name); i++)
-		imx911->supplies[i].supply = imx911_supply_name[i];
-
-	return devm_regulator_bulk_get(&client->dev,
-				       ARRAY_SIZE(imx911_supply_name),
-				       imx911->supplies);
-#endif
-    return 0;
-}
-
-/* Verify chip ID */
-static int imx911_identify_module(struct imx911 *imx911)
-{
-#if 0
-	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
-	int ret;
-	u32 val;
-
-	ret = imx911_read_reg(imx911, IMX708_REG_CHIP_ID,
-			      IMX708_REG_VALUE_16BIT, &val);
-	if (ret) {
-		dev_err(&client->dev, "failed to read chip id %x, with error %d\n",
-			IMX708_CHIP_ID, ret);
-		return ret;
-	}
-
-	if (val != IMX708_CHIP_ID) {
-		dev_err(&client->dev, "chip id mismatch: %x!=%x\n",
-			IMX708_CHIP_ID, val);
-		return -EIO;
-	}
-
-	ret = imx911_read_reg(imx911, 0x0000, IMX708_REG_VALUE_16BIT, &val);
-	if (!ret) {
-		dev_info(&client->dev, "camera module ID 0x%04x\n", val);
-		snprintf(imx911->sd.name, sizeof(imx911->sd.name), "imx911%s%s",
-			 val & 0x02 ? "_wide" : "",
-			 val & 0x80 ? "_noir" : "");
-	}
-#endif
-	return 0;
-}
-
 static const struct v4l2_subdev_core_ops imx911_core_ops = {
 	.subscribe_event = v4l2_ctrl_subdev_subscribe_event,
 	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
@@ -1670,13 +1616,6 @@ static int imx911_init_controls(struct imx911 *imx911)
 
 	mutex_init(&imx911->mutex);
 	ctrl_hdlr->lock = &imx911->mutex;
-
-	/* By default, PIXEL_RATE is read only */
-	imx911->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
-					       V4L2_CID_PIXEL_RATE,
-					       IMX708_INITIAL_PIXEL_RATE,
-					       IMX708_INITIAL_PIXEL_RATE, 1,
-					       IMX708_INITIAL_PIXEL_RATE);
 
 	ctrl = v4l2_ctrl_new_int_menu(ctrl_hdlr, &imx911_ctrl_ops,
 				      V4L2_CID_LINK_FREQ, 0, 0,
@@ -1779,61 +1718,6 @@ static void imx911_free_controls(struct imx911 *imx911)
 	mutex_destroy(&imx911->mutex);
 }
 
-static int imx911_check_hwcfg(struct device *dev, struct imx911 *imx911)
-{
-	struct fwnode_handle *endpoint;
-	struct v4l2_fwnode_endpoint ep_cfg = {
-		.bus_type = V4L2_MBUS_CSI2_DPHY
-	};
-	int ret = -EINVAL;
-	int i;
-
-	endpoint = fwnode_graph_get_next_endpoint(dev_fwnode(dev), NULL);
-	if (!endpoint) {
-		dev_err(dev, "endpoint node not found\n");
-		return -EINVAL;
-	}
-
-	if (v4l2_fwnode_endpoint_alloc_parse(endpoint, &ep_cfg)) {
-		dev_err(dev, "could not parse endpoint\n");
-		goto error_out;
-	}
-
-	/* Check the number of MIPI CSI2 data lanes */
-	if (ep_cfg.bus.mipi_csi2.num_data_lanes != 2) {
-		dev_err(dev, "only 2 data lanes are currently supported\n");
-		goto error_out;
-	}
-
-	/* Check the link frequency set in device tree */
-	if (!ep_cfg.nr_of_link_frequencies) {
-		dev_err(dev, "link-frequency property not found in DT\n");
-		goto error_out;
-	}
-
-	for (i = 0; i < ARRAY_SIZE(link_freqs); i++) {
-		if (link_freqs[i] == ep_cfg.link_frequencies[0]) {
-			imx911->link_freq_idx = i;
-			break;
-		}
-	}
-
-	if (i == ARRAY_SIZE(link_freqs)) {
-		dev_err(dev, "Link frequency not supported: %lld\n",
-			ep_cfg.link_frequencies[0]);
-			ret = -EINVAL;
-			goto error_out;
-	}
-
-	ret = 0;
-
-error_out:
-	v4l2_fwnode_endpoint_free(&ep_cfg);
-	fwnode_handle_put(endpoint);
-
-	return ret;
-}
-
 static int imx911_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
@@ -1846,54 +1730,13 @@ static int imx911_probe(struct i2c_client *client)
 
 	v4l2_i2c_subdev_init(&imx911->sd, client, &imx911_subdev_ops);
 
-	/* Check the hardware configuration in device tree */
-	if (imx911_check_hwcfg(dev, imx911))
-		return -EINVAL;
-
-	/* Get system clock (inclk) */
-	imx911->inclk = devm_clk_get(dev, "inclk");
-	if (IS_ERR(imx911->inclk))
-		return dev_err_probe(dev, PTR_ERR(imx911->inclk),
-				     "failed to get inclk\n");
-
-	imx911->inclk_freq = clk_get_rate(imx911->inclk);
-	if (imx911->inclk_freq != IMX708_INCLK_FREQ)
-		return dev_err_probe(dev, -EINVAL,
-				     "inclk frequency not supported: %d Hz\n",
-				     imx911->inclk_freq);
-
-	ret = imx911_get_regulators(imx911);
-	if (ret)
-		return dev_err_probe(dev, ret, "failed to get regulators\n");
-
-	/* Request optional enable pin */
-	imx911->reset_gpio = devm_gpiod_get_optional(dev, "reset",
-						     GPIOD_OUT_HIGH);
-
-	/*
-	 * The sensor must be powered for imx911_identify_module()
-	 * to be able to read the CHIP_ID register
-	 */
-	ret = imx911_power_on(dev);
-	if (ret)
-		return ret;
-
-	ret = imx911_identify_module(imx911);
-	if (ret)
-		goto error_power_off;
-
 	/* Initialize default format */
 	imx911_set_default_format(imx911);
-
-	/* Enable runtime PM and turn off the device */
-	pm_runtime_set_active(dev);
-	pm_runtime_enable(dev);
-	pm_runtime_idle(dev);
 
 	/* This needs the pm runtime to be registered. */
 	ret = imx911_init_controls(imx911);
 	if (ret)
-		goto error_pm_runtime;
+		goto error_handler_free;
 
 	/* Initialize subdev */
 	imx911->sd.internal_ops = &imx911_internal_ops;
@@ -1924,13 +1767,6 @@ error_media_entity:
 
 error_handler_free:
 	imx911_free_controls(imx911);
-
-error_pm_runtime:
-	pm_runtime_disable(&client->dev);
-	pm_runtime_set_suspended(&client->dev);
-
-error_power_off:
-	imx911_power_off(&client->dev);
 
 	return ret;
 }
