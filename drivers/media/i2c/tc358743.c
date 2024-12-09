@@ -778,7 +778,7 @@ static const struct imx911_mode supported_modes_10bit_hdr[] = {
  * - v flip
  * - h&v flips
  */
-static const u32 codes[] = {
+static const u32 imx_codes[] = {
 	/* 10-bit modes. */
 	MEDIA_BUS_FMT_SRGGB10_1X10,
 	MEDIA_BUS_FMT_SGRBG10_1X10,
@@ -836,6 +836,7 @@ struct imx911 {
 
 	struct v4l2_ctrl_handler ctrl_handler;
 	/* V4L2 Controls */
+	struct v4l2_ctrl *pixel_rate;
 	struct v4l2_ctrl *exposure;
 	struct v4l2_ctrl *vblank;
 	struct v4l2_ctrl *hblank;
@@ -907,7 +908,7 @@ static u32 imx911_get_format_code(struct imx911 *imx911)
 	i = (imx911->vflip->val ? 2 : 0) |
 	    (imx911->hflip->val ? 1 : 0);
 
-	return codes[i];
+	return imx_codes[i];
 }
 
 static void imx911_set_default_format(struct imx911 *imx911)
@@ -1043,6 +1044,9 @@ static void imx911_set_framing_limits(struct imx911 *imx911)
 {
 	const struct imx911_mode *mode = imx911->mode;
 	unsigned int hblank;
+	__v4l2_ctrl_modify_range(imx911->pixel_rate,
+				 mode->pixel_rate, mode->pixel_rate,
+				 1, mode->pixel_rate);
 
 	/* Update limits and set FPS to default */
 	__v4l2_ctrl_modify_range(imx911->vblank, mode->vblank_min,
@@ -1148,7 +1152,7 @@ static int imx911_enum_mbus_code(struct v4l2_subdev *sd,
 		return -EINVAL;
 
 	if (code->pad == IMAGE_PAD) {
-		if (code->index >= (ARRAY_SIZE(codes) / 4))
+		if (code->index >= (ARRAY_SIZE(imx_codes) / 4))
 			return -EINVAL;
 
 		code->code = imx911_get_format_code(imx911);
@@ -1569,6 +1573,13 @@ static int imx911_init_controls(struct imx911 *imx911)
 
 	mutex_init(&imx911->mutex);
 	ctrl_hdlr->lock = &imx911->mutex;
+
+	/* By default, PIXEL_RATE is read only */
+	imx911->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
+					       V4L2_CID_PIXEL_RATE,
+					       IMX708_INITIAL_PIXEL_RATE,
+					       IMX708_INITIAL_PIXEL_RATE, 1,
+					       IMX708_INITIAL_PIXEL_RATE);
 
 	ctrl = v4l2_ctrl_new_int_menu(ctrl_hdlr, &imx911_ctrl_ops,
 				      V4L2_CID_LINK_FREQ, 0, 0,
