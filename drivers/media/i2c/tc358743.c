@@ -1193,6 +1193,7 @@ static int imx911_probe(struct i2c_client *client)
 	if (!shared)
 		return -ENOMEM;
 
+#ifdef USE_LEGACY_PADS
 	v4l2_i2c_subdev_init(&shared->sd, client, &imx911_subdev_ops);
 
 	/* Initialize default format */
@@ -1218,6 +1219,7 @@ static int imx911_probe(struct i2c_client *client)
 		dev_err(dev, "failed to init entity pads: %d\n", ret);
 		goto error_handler_free;
 	}
+#endif
 
 	ret = v4l2_async_register_subdev_sensor(&shared->sd);
 	if (ret < 0) {
@@ -1752,7 +1754,7 @@ static inline void tc358743_sleep_mode(struct v4l2_subdev *sd, bool enable)
 			enable ? MASK_SLEEP : 0);
 }
 
-static inline void enable_stream(struct v4l2_subdev *sd, bool enable)
+static inline void tc358743_enable_stream(struct v4l2_subdev *sd, bool enable)
 {
 	shared_t *tc3 = to_tc3(sd);
 
@@ -2231,13 +2233,13 @@ static void tc358743_format_change(struct v4l2_subdev *sd)
 	};
 
 	if (tc358743_get_detected_timings(sd, &timings)) {
-		enable_stream(sd, false);
+		tc358743_enable_stream(sd, false);
 
 		v4l2_dbg(1, debug, sd, "%s: No signal\n",
 				__func__);
 	} else {
 		if (!v4l2_match_dv_timings(&tc3->timings, &timings, 0, false))
-			enable_stream(sd, false);
+			tc358743_enable_stream(sd, false);
 
 		if (debug)
 			v4l2_print_dv_timings(sd->name,
@@ -2785,7 +2787,7 @@ static int tc358743_s_dv_timings(struct v4l2_subdev *sd,
 
 	tc3->timings = *timings;
 
-	enable_stream(sd, false);
+	tc358743_enable_stream(sd, false);
 	tc358743_set_pll(sd);
 	tc358743_set_csi(sd);
 
@@ -2862,7 +2864,7 @@ static int tc358743_get_mbus_config(struct v4l2_subdev *sd,
 
 static int tc358743_s_stream(struct v4l2_subdev *sd, int enable)
 {
-	enable_stream(sd, enable);
+	tc358743_enable_stream(sd, enable);
 	if (!enable) {
 		/* Put all lanes in LP-11 tc3 (STOPSTATE) */
 		tc358743_set_csi(sd);
@@ -2943,7 +2945,7 @@ static int tc358743_set_fmt(struct v4l2_subdev *sd,
 
 	tc3->mbus_fmt_code = format->format.code;
 
-	enable_stream(sd, false);
+	tc358743_enable_stream(sd, false);
 	tc358743_set_pll(sd);
 	tc358743_set_csi(sd);
 	tc358743_set_csi_color_space(sd);
@@ -3335,13 +3337,37 @@ static int tc358743_probe(struct i2c_client *client)
 		goto err_hdl;
 	}
 
-	shared->pad[IMAGE_PAD].flags = MEDIA_PAD_FL_SOURCE;
-	sd->entity.function = MEDIA_ENT_F_VID_IF_BRIDGE;
-	err = media_entity_pads_init(&sd->entity, 1, &shared->pad[IMAGE_PAD]);
-	if (err < 0)
-		goto err_hdl;
+#ifdef USE_LEGACY_PADS
+    #define PAD_CNT 1
+    shared->pad[IMAGE_PAD].flags = MEDIA_PAD_FL_SOURCE;
 
-	shared->mbus_fmt_code = MEDIA_BUS_FMT_RGB888_1X24;
+    sd->entity.function = MEDIA_ENT_F_VID_IF_BRIDGE;
+    err = media_entity_pads_init(&sd->entity, 1, &shared->pad[IMAGE_PAD]);
+    if (err < 0)
+        goto err_hdl;
+
+
+#else
+    #define PAD_CNT 2
+    shared->sd.internal_ops = &imx911_internal_ops;
+    shared->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE |
+                V4L2_SUBDEV_FL_HAS_EVENTS;
+    shared->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
+
+    /* Initialize source pads */
+    shared->pad[IMAGE_PAD].flags = MEDIA_PAD_FL_SOURCE;
+    shared->pad[METADATA_PAD].flags = MEDIA_PAD_FL_SOURCE;
+
+#endif
+
+    ret = media_entity_pads_init(&shared->sd.entity, PAD_CNT, shared->pad);
+    if (ret) {
+        dev_err(dev, "failed to init entity pads: %d\n", ret);
+        goto error_handler_free;
+    }
+   
+    shared->mbus_fmt_code = MEDIA_BUS_FMT_RGB888_1X24;
+
 
 	sd->dev = &client->dev;
 
