@@ -3270,7 +3270,7 @@ static int tc358743_probe(struct i2c_client *client)
 
 	struct tc358743_platform_data *pdata = client->dev.platform_data;
 	struct v4l2_subdev *sd;
-
+    int ret;
 	u16 irq_mask = MASK_HDMI_MSK | MASK_CSI_MSK;
 	u16 chipid;
 	int err;
@@ -3345,13 +3345,9 @@ static int tc358743_probe(struct i2c_client *client)
     err = media_entity_pads_init(&sd->entity, 1, &shared->pad[IMAGE_PAD]);
     if (err < 0)
         goto err_hdl;
-
-
 #else
     #define PAD_CNT 2
-    shared->sd.internal_ops = &imx911_internal_ops;
-    shared->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE |
-                V4L2_SUBDEV_FL_HAS_EVENTS;
+    shared->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE | V4L2_SUBDEV_FL_HAS_EVENTS;
     shared->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
 
     /* Initialize source pads */
@@ -3362,8 +3358,8 @@ static int tc358743_probe(struct i2c_client *client)
 
     ret = media_entity_pads_init(&shared->sd.entity, PAD_CNT, shared->pad);
     if (ret) {
-        dev_err(dev, "failed to init entity pads: %d\n", ret);
-        goto error_handler_free;
+		v4l2_err(sd, "failed to init entity pads: %d\n", ret);
+        goto err_hdl;
     }
    
     shared->mbus_fmt_code = MEDIA_BUS_FMT_RGB888_1X24;
