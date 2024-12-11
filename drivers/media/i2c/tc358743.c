@@ -1485,99 +1485,6 @@ err_unlock:
     return 0;
 }
 
-/* Power/clock management functions */
-static int imx911_power_on(struct device *dev)
-{
-#if 0
-	struct i2c_client *client = to_i2c_client(dev);
-	struct v4l2_subdev *sd = i2c_get_clientdata(client);
-	imx911_t *imx911 = to_imx911(sd);
-	int ret;
-
-	ret = regulator_bulk_enable(ARRAY_SIZE(imx911_supply_name),
-				    imx911->supplies);
-	if (ret) {
-		dev_err(&client->dev, "%s: failed to enable regulators\n",
-			__func__);
-		return ret;
-	}
-
-	ret = clk_prepare_enable(imx911->inclk);
-	if (ret) {
-		dev_err(&client->dev, "%s: failed to enable clock\n",
-			__func__);
-		goto reg_off;
-	}
-
-	gpiod_set_value_cansleep(imx911->reset_gpio, 1);
-	usleep_range(IMX708_XCLR_MIN_DELAY_US,
-		     IMX708_XCLR_MIN_DELAY_US + IMX708_XCLR_DELAY_RANGE_US);
-
-	return 0;
-
-reg_off:
-	regulator_bulk_disable(ARRAY_SIZE(imx911_supply_name),
-			       imx911->supplies);
-	return ret;
-#endif
-    return 0;
-}
-
-static int imx911_power_off(struct device *dev)
-{
-#if 0
-	struct i2c_client *client = to_i2c_client(dev);
-	struct v4l2_subdev *sd = i2c_get_clientdata(client);
-	imx911_t *imx911 = to_imx911(sd);
-
-	gpiod_set_value_cansleep(imx911->reset_gpio, 0);
-	regulator_bulk_disable(ARRAY_SIZE(imx911_supply_name),
-			       imx911->supplies);
-	clk_disable_unprepare(imx911->inclk);
-
-	/* Force reprogramming of the common registers when powered up again. */
-	imx911->common_regs_written = false;
-#endif
-	return 0;
-}
-
-static int __maybe_unused imx911_suspend(struct device *dev)
-{
-#if 0
-	struct i2c_client *client = to_i2c_client(dev);
-	struct v4l2_subdev *sd = i2c_get_clientdata(client);
-	imx911_t *imx911 = to_imx911(sd);
-
-	if (imx911->streaming)
-		imx911_stop_streaming(imx911);
-#endif
-	return 0;
-}
-
-static int __maybe_unused imx911_resume(struct device *dev)
-{
-#if 0
-	struct i2c_client *client = to_i2c_client(dev);
-	struct v4l2_subdev *sd = i2c_get_clientdata(client);
-	imx911_t *imx911 = to_imx911(sd);
-	int ret;
-
-	if (imx911->streaming) {
-		ret = imx911_start_streaming(imx911);
-		if (ret)
-			goto error;
-	}
-
-	return 0;
-
-error:
-	imx911_stop_streaming(imx911);
-	imx911->streaming = 0;
-	return ret;
-#endif
-    return 0;
-}
-
 static const struct v4l2_subdev_core_ops imx911_core_ops = {
 	.subscribe_event = v4l2_ctrl_subdev_subscribe_event,
 	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
@@ -1818,11 +1725,6 @@ static const struct of_device_id imx911_dt_ids[] = {
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, imx911_dt_ids);
-
-static const struct dev_pm_ops imx911_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(imx911_suspend, imx911_resume)
-	SET_RUNTIME_PM_OPS(imx911_power_off, imx911_power_on, NULL)
-};
 
 #if 0
 static struct i2c_driver imx911_i2c_driver = {
