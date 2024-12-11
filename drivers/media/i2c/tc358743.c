@@ -306,56 +306,6 @@ struct imx911_mode {
 	bool remosaic;
 };
 
-/* Default PDAF pixel correction gains */
-static const u8 pdaf_gains[2][9] = {
-	{ 0x4c, 0x4c, 0x4c, 0x46, 0x3e, 0x38, 0x35, 0x35, 0x35 },
-	{ 0x35, 0x35, 0x35, 0x38, 0x3e, 0x46, 0x4c, 0x4c, 0x4c }
-};
-
-/* Link frequency setup */
-enum {
-	IMX708_LINK_FREQ_450MHZ,
-	IMX708_LINK_FREQ_447MHZ,
-	IMX708_LINK_FREQ_453MHZ,
-};
-
-static const s64 link_freqs[] = {
-	[IMX708_LINK_FREQ_450MHZ] = 450000000,
-	[IMX708_LINK_FREQ_447MHZ] = 447000000,
-	[IMX708_LINK_FREQ_453MHZ] = 453000000,
-};
-
-/* 450MHz is the nominal "default" link frequency */
-static const struct imx911_reg link_450Mhz_regs[] = {
-	{0x030E, 0x01},
-	{0x030F, 0x2c},
-};
-
-static const struct imx911_reg link_447Mhz_regs[] = {
-	{0x030E, 0x01},
-	{0x030F, 0x2a},
-};
-
-static const struct imx911_reg link_453Mhz_regs[] = {
-	{0x030E, 0x01},
-	{0x030F, 0x2e},
-};
-
-static const struct imx911_reg_list link_freq_regs[] = {
-	[IMX708_LINK_FREQ_450MHZ] = {
-		.regs = link_450Mhz_regs,
-		.num_of_regs = ARRAY_SIZE(link_450Mhz_regs)
-	},
-	[IMX708_LINK_FREQ_447MHZ] = {
-		.regs = link_447Mhz_regs,
-		.num_of_regs = ARRAY_SIZE(link_447Mhz_regs)
-	},
-	[IMX708_LINK_FREQ_453MHZ] = {
-		.regs = link_453Mhz_regs,
-		.num_of_regs = ARRAY_SIZE(link_453Mhz_regs)
-	},
-};
-
 static const struct imx911_reg mode_common_regs[] = {
 	{0x0100, 0x00},
 	{0x0136, 0x18},
@@ -1530,12 +1480,11 @@ static int imx911_init_controls(imx911_t *imx911)
 	struct v4l2_ctrl_handler *ctrl_hdlr;
 	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
 	struct v4l2_fwnode_device_properties props;
-	struct v4l2_ctrl *ctrl;
 	unsigned int i;
 	int ret;
 
 	ctrl_hdlr = &imx911->ctrl_handler;
-	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 16);
+	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 15);
 	if (ret)
 		return ret;
 
@@ -1548,12 +1497,6 @@ static int imx911_init_controls(imx911_t *imx911)
 					       IMX708_INITIAL_PIXEL_RATE,
 					       IMX708_INITIAL_PIXEL_RATE, 1,
 					       IMX708_INITIAL_PIXEL_RATE);
-
-	ctrl = v4l2_ctrl_new_int_menu(ctrl_hdlr, &imx911_ctrl_ops,
-				      V4L2_CID_LINK_FREQ, 0, 0,
-				      &link_freqs[imx911->link_freq_idx]);
-	if (ctrl)
-		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
 	/*
 	 * Create the controls here, but mode specific limits are setup
