@@ -52,19 +52,18 @@
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-mediabus.h>
 
-
 enum pad_types {
 	IMAGE_PAD,
 	METADATA_PAD,
 	NUM_PADS
 };
 
-struct shared {
+static int debug = 1111;
+
+typedef struct {
 	struct tc358743_platform_data pdata;
 	struct v4l2_mbus_config_mipi_csi2 bus;
 	struct v4l2_subdev sd;
-
-	struct v4l2_ctrl_handler hdl;
 
 	struct i2c_client *i2c_client;
 
@@ -135,11 +134,9 @@ struct shared {
 
 //--------------imx
 
-} magic_t;
+}shared_t;
 
-typedef struct shared shared_t;
-
-shared_t *shared;  //tc3 and imx only use ONE alloc
+shared_t *shared = NULL;  //tc3 and imx only use ONE alloc
 
 /*
  * Parameter to adjust Quad Bayer re-mosaic broken line correction
@@ -592,14 +589,32 @@ static void imx911_adjust_exposure_range(shared_t *imx911,
 					 struct v4l2_ctrl *ctrl)
 {
 	int exposure_max, exposure_def;
+    
+    struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
+
+    dev_err(&client->dev, "DEEBUG ---- %s:%d -> %p %p %p\n",
+         __FUNCTION__ , __LINE__, imx911, ctrl, imx911->exposure );
+
+
+    dev_err(&client->dev, "DEEBUG -mid --- %s:%d -> %p\n",
+         __FUNCTION__ , __LINE__, imx911->mode );
 
 	/* Honour the VBLANK limits when setting exposure. */
 	exposure_max = imx911->mode->height + imx911->vblank->val -
 		IMX708_EXPOSURE_OFFSET;
+
+    dev_err(&client->dev, "DEEBUG -mid --- %s:%d -> %p %p %p\n",
+         __FUNCTION__ , __LINE__, imx911, ctrl, imx911->exposure );
+
+
 	exposure_def = min(exposure_max, imx911->exposure->val);
 	__v4l2_ctrl_modify_range(imx911->exposure, imx911->exposure->minimum,
 				 exposure_max, imx911->exposure->step,
 				 exposure_def);
+
+    dev_err(&client->dev, "DEEBUG -out--- %s:%d -> %p %p %p\n",
+         __FUNCTION__ , __LINE__, imx911, ctrl, imx911->exposure );
+
 }
 
 static int imx911_set_analogue_gain(shared_t *imx911, unsigned int val)
@@ -666,12 +681,35 @@ static void imx911_set_framing_limits(shared_t *imx911)
 
 static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
 {
-	shared_t *imx911 =
-		container_of(ctrl->handler, shared_t, ctrl_handler);
-	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
+
+//	v4l_dbg(1, debug, ctrl->client, "chip found @ 0x%x (%s)\n",
+//		client->addr << 1, client->adapter->name);
+    /**
+     * container_of - cast a member of a structure out to the containing structure
+     * @ptr:        the pointer to the member.
+     * @type:       the type of the container struct this is embedded in.
+     * @member:     the name of the member within the struct.
+     *
+     */
+
+    /*
+      #define container_of(ptr, type, member) ({              \
+        const typeof( ((type *)0)->member ) *__mptr = (ptr);  \
+        (type *)( (char *)__mptr - offsetof(type,member) );})
+    */
+
+
+	//shared_t *shared = container_of(ctrl->handler, shared_t, ctrl_handler);
+
+	struct i2c_client *client = v4l2_get_subdevdata(&shared->sd);
+    dev_err(&client->dev, "DEEBUG ------in-------- %s:%d hi don\n", __func__, __LINE__);
+
 	const struct imx911_mode *mode_list;
 	unsigned int code, num_modes;
 	int ret = 0;
+
+    dev_err(&client->dev, "DEEBUG ---------------- %s:%d hi don id=%d 0x%X \n", __func__, __LINE__, ctrl->id, ctrl->id);
+
 
 	switch (ctrl->id) {
 	case V4L2_CID_VBLANK:
@@ -679,7 +717,8 @@ static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
 		 * The VBLANK control may change the limits of usable exposure,
 		 * so check and adjust if necessary.
 		 */
-		imx911_adjust_exposure_range(imx911, ctrl);
+        dev_err(&client->dev, "DEEBUG ---------------- %s:%d hi don\n", __func__, __LINE__);
+		imx911_adjust_exposure_range(shared, ctrl);
 		break;
 
 	case V4L2_CID_WIDE_DYNAMIC_RANGE:
@@ -688,15 +727,16 @@ static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
 		 * as it doesn't set any registers. Don't do anything if the mode
 		 * already matches.
 		 */
-		if (imx911->mode && imx911->mode->hdr != ctrl->val) {
-			code = imx911_get_format_code(imx911);
+        dev_err(&client->dev, "DEEBUG ---------------- %s:%d hi don\n", __func__, __LINE__);
+		if (shared->mode && shared->mode->hdr != ctrl->val) {
+			code = imx911_get_format_code(shared);
 			get_mode_table(code, &mode_list, &num_modes, ctrl->val);
-			imx911->mode = v4l2_find_nearest_size(mode_list,
+			shared->mode = v4l2_find_nearest_size(mode_list,
 							      num_modes,
 							      width, height,
-							      imx911->mode->width,
-							      imx911->mode->height);
-			imx911_set_framing_limits(imx911);
+							      shared->mode->width,
+							      shared->mode->height);
+			imx911_set_framing_limits(shared);
 		}
 		break;
 	}
@@ -704,10 +744,12 @@ static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
     ret = 0;
 	switch (ctrl->id) {
 	case V4L2_CID_ANALOGUE_GAIN:
-		imx911_set_analogue_gain(imx911, ctrl->val);
+        dev_err(&client->dev, "DEEBUG ---------------- %s:%d hi don\n", __func__, __LINE__);
+		imx911_set_analogue_gain(shared, ctrl->val);
 		break;
 	case V4L2_CID_EXPOSURE:
-		ret = imx911_set_exposure(imx911, ctrl->val);
+        dev_err(&client->dev, "DEEBUG ---------------- %s:%d hi don\n", __func__, __LINE__);
+		ret = imx911_set_exposure(shared, ctrl->val);
 		break;
 	case V4L2_CID_DIGITAL_GAIN:
 	case V4L2_CID_TEST_PATTERN:
@@ -720,8 +762,9 @@ static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
         break;
 
 	case V4L2_CID_VBLANK:
-		ret = imx911_set_frame_length(imx911,
-					      imx911->mode->height + ctrl->val);
+        dev_err(&client->dev, "DEEBUG ---------------- %s:%d hi don\n", __func__, __LINE__);
+		ret = imx911_set_frame_length(shared,
+					      shared->mode->height + ctrl->val);
 		break;
 	case V4L2_CID_NOTIFY_GAINS:
 		break;
@@ -729,12 +772,15 @@ static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
 		/* Already handled above. */
 		break;
 	default:
+        dev_err(&client->dev, "DEEBUG ---------------- %s:%d hi don\n", __func__, __LINE__);
 		dev_info(&client->dev,
 			 "ctrl(id:0x%x,val:0x%x) is not handled\n",
 			 ctrl->id, ctrl->val);
 		ret = -EINVAL;
 		break;
 	}
+
+    dev_err(&client->dev, "DEEBUG -------out------ %s:%d hi don\n", __func__, __LINE__);
 
 	return ret;
 }
@@ -765,6 +811,25 @@ static int imx911_enum_mbus_code(struct v4l2_subdev *sd,
 	}
 
 	return 0;
+}
+
+static void imx708_set_default_format(shared_t *shared)
+{
+	struct v4l2_mbus_framefmt *fmt = &shared->fmt;
+
+	/* Set default mode to max resolution */
+	shared->mode = &supported_modes_10bit_no_hdr[0];
+
+	/* fmt->code not set as it will always be computed based on flips */
+	fmt->colorspace = V4L2_COLORSPACE_RAW;
+	fmt->ycbcr_enc = V4L2_MAP_YCBCR_ENC_DEFAULT(fmt->colorspace);
+	fmt->quantization = V4L2_MAP_QUANTIZATION_DEFAULT(true,
+							  fmt->colorspace,
+							  fmt->ycbcr_enc);
+	fmt->xfer_func = V4L2_MAP_XFER_FUNC_DEFAULT(fmt->colorspace);
+	fmt->width = shared->mode->width;
+	fmt->height = shared->mode->height;
+	fmt->field = V4L2_FIELD_NONE;
 }
 
 static int imx911_enum_frame_size(struct v4l2_subdev *sd,
@@ -3313,22 +3378,23 @@ static int tc358743_probe(struct i2c_client *client)
 		return -ENODEV;
 	}
 
+#ifdef USE_LEGACY_CONTROLS
 	/* control handlers */
-	v4l2_ctrl_handler_init(&shared->hdl, 3);
+	v4l2_ctrl_handler_init(&shared->ctrl_handler, 3);
 
-	shared->detect_tx_5v_ctrl = v4l2_ctrl_new_std(&shared->hdl, NULL,
+	shared->detect_tx_5v_ctrl = v4l2_ctrl_new_std(&shared->ctrl_handler, NULL,
 			V4L2_CID_DV_RX_POWER_PRESENT, 0, 1, 0, 0);
 
 	/* custom controls */
-	shared->audio_sampling_rate_ctrl = v4l2_ctrl_new_custom(&shared->hdl,
+	shared->audio_sampling_rate_ctrl = v4l2_ctrl_new_custom(&shared->ctrl_handler,
 			&tc358743_ctrl_audio_sampling_rate, NULL);
 
-	shared->audio_present_ctrl = v4l2_ctrl_new_custom(&shared->hdl,
+	shared->audio_present_ctrl = v4l2_ctrl_new_custom(&shared->ctrl_handler,
 			&tc358743_ctrl_audio_present, NULL);
 
-	sd->ctrl_handler = &shared->hdl;
-	if (shared->hdl.error) {
-		err = shared->hdl.error;
+	sd->ctrl_handler = &shared->ctrl_handler;
+	if (shared->ctrl_handler.error) {
+		err = shared->ctrl_handler.error;
 		goto err_hdl;
 	}
 
@@ -3336,6 +3402,125 @@ static int tc358743_probe(struct i2c_client *client)
 		err = -ENODEV;
 		goto err_hdl;
 	}
+#else
+	/* Initialize default format */
+	imx708_set_default_format(shared);
+
+	struct v4l2_fwnode_device_properties props;
+
+	sd->ctrl_handler = &shared->ctrl_handler;
+
+    struct v4l2_ctrl_handler *ctrl_hdlr = &shared->ctrl_handler; 
+
+    ret = v4l2_ctrl_handler_init(ctrl_hdlr, 15 + 3);
+    if (ret)
+        return ret;
+
+    mutex_init(&shared->mutex);
+    ctrl_hdlr->lock = &shared->mutex;
+
+    // load up 3 tc3 controls first
+	shared->detect_tx_5v_ctrl = v4l2_ctrl_new_std(&shared->ctrl_handler, NULL,
+			V4L2_CID_DV_RX_POWER_PRESENT, 0, 1, 0, 0);
+
+	/* custom controls */
+	shared->audio_sampling_rate_ctrl = v4l2_ctrl_new_custom(&shared->ctrl_handler,
+			&tc358743_ctrl_audio_sampling_rate, NULL);
+
+	shared->audio_present_ctrl = v4l2_ctrl_new_custom(&shared->ctrl_handler,
+			&tc358743_ctrl_audio_present, NULL);
+
+
+    /* By default, PIXEL_RATE is read only */
+    shared->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
+                           V4L2_CID_PIXEL_RATE,
+                           IMX708_INITIAL_PIXEL_RATE,
+                           IMX708_INITIAL_PIXEL_RATE, 1,
+                           IMX708_INITIAL_PIXEL_RATE);
+
+    /*
+     * Create the controls here, but mode specific limits are setup
+     * in the imx911_set_framing_limits() call below.
+     */
+    shared->vblank = v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
+                       V4L2_CID_VBLANK, 0, 0xffff, 1, 0);
+    shared->hblank = v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
+                       V4L2_CID_HBLANK, 0, 0xffff, 1, 0);
+
+    shared->exposure = v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
+                         V4L2_CID_EXPOSURE,
+                         IMX708_EXPOSURE_MIN,
+                         IMX708_EXPOSURE_MAX,
+                         IMX708_EXPOSURE_STEP,
+                         IMX708_EXPOSURE_DEFAULT);
+
+    v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
+              IMX708_ANA_GAIN_MIN, IMX708_ANA_GAIN_MAX,
+              IMX708_ANA_GAIN_STEP, IMX708_ANA_GAIN_DEFAULT);
+
+    v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops, V4L2_CID_DIGITAL_GAIN,
+              IMX708_DGTL_GAIN_MIN, IMX708_DGTL_GAIN_MAX,
+              IMX708_DGTL_GAIN_STEP, IMX708_DGTL_GAIN_DEFAULT);
+
+    shared->hflip = v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
+                      V4L2_CID_HFLIP, 0, 1, 1, 0);
+
+    shared->vflip = v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
+                      V4L2_CID_VFLIP, 0, 1, 1, 0);
+    v4l2_ctrl_cluster(2, &shared->hflip);
+
+    v4l2_ctrl_new_std_menu_items(ctrl_hdlr, &imx911_ctrl_ops,
+                     V4L2_CID_TEST_PATTERN,
+                     ARRAY_SIZE(imx911_test_pattern_menu) - 1,
+                     0, 0, imx911_test_pattern_menu);
+    for (int i = 0; i < 4; i++) {
+        /*
+         * The assumption is that
+         * V4L2_CID_TEST_PATTERN_GREENR == V4L2_CID_TEST_PATTERN_RED + 1
+         * V4L2_CID_TEST_PATTERN_BLUE   == V4L2_CID_TEST_PATTERN_RED + 2
+         * V4L2_CID_TEST_PATTERN_GREENB == V4L2_CID_TEST_PATTERN_RED + 3
+         */
+        v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
+                  V4L2_CID_TEST_PATTERN_RED + i,
+                  IMX708_TEST_PATTERN_COLOUR_MIN,
+                  IMX708_TEST_PATTERN_COLOUR_MAX,
+                  IMX708_TEST_PATTERN_COLOUR_STEP,
+                  IMX708_TEST_PATTERN_COLOUR_MAX);
+        /* The "Solid color" pattern is white by default */
+    }
+
+    v4l2_ctrl_new_custom(ctrl_hdlr, &imx911_notify_gains_ctrl, NULL);
+
+    shared->hdr_mode = v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
+                         V4L2_CID_WIDE_DYNAMIC_RANGE,
+                         0, 1, 1, 0);
+
+    ret = v4l2_fwnode_device_parse(&client->dev, &props);
+    if (ret)
+        goto err_hdl;
+
+    v4l2_ctrl_new_fwnode_properties(ctrl_hdlr, &imx911_ctrl_ops, &props);
+
+    if (ctrl_hdlr->error) {
+        ret = ctrl_hdlr->error;
+        dev_err(&client->dev, "%s control init failed (%d)\n",
+            __func__, ret);
+        goto err_hdl;
+    }
+
+    shared->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+    shared->hflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
+    shared->vflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
+    shared->hdr_mode->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
+
+    shared->sd.ctrl_handler = ctrl_hdlr;
+
+    /* Setup exposure and frame/line length limits. */
+    ///imx911_set_framing_limits(shared);
+
+
+#endif
+
 
 #ifdef USE_LEGACY_PADS
     #define PAD_CNT 1
@@ -3440,7 +3625,7 @@ err_work_queues:
 	mutex_destroy(&shared->confctl_mutex);
 err_hdl:
 	media_entity_cleanup(&sd->entity);
-	v4l2_ctrl_handler_free(&shared->hdl);
+	v4l2_ctrl_handler_free(&shared->ctrl_handler);
 	return err;
 }
 
@@ -3459,7 +3644,7 @@ static void tc358743_remove(struct i2c_client *client)
 	v4l2_device_unregister_subdev(sd);
 	mutex_destroy(&tc3->confctl_mutex);
 	media_entity_cleanup(&sd->entity);
-	v4l2_ctrl_handler_free(&tc3->hdl);
+	v4l2_ctrl_handler_free(&tc3->ctrl_handler);
 }
 
 static const struct i2c_device_id tc358743_id[] = {
