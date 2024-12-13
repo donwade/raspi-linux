@@ -702,14 +702,12 @@ static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
 	//shared_t *shared = container_of(ctrl->handler, shared_t, ctrl_handler);
 
 	struct i2c_client *client = v4l2_get_subdevdata(&shared->sd);
-    dev_err(&client->dev, "DEEBUG ------in-------- %s:%d hi don\n", __func__, __LINE__);
 
 	const struct imx911_mode *mode_list;
 	unsigned int code, num_modes;
 	int ret = 0;
 
-    dev_err(&client->dev, "DEEBUG ---------------- %s:%d hi don id=%d 0x%X \n", __func__, __LINE__, ctrl->id, ctrl->id);
-
+    dev_err(&client->dev, "DEEBUG  %s:%d -> id=%d 0x%X \n", __func__, __LINE__, ctrl->id, ctrl->id);
 
 	switch (ctrl->id) {
 	case V4L2_CID_VBLANK:
@@ -717,7 +715,6 @@ static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
 		 * The VBLANK control may change the limits of usable exposure,
 		 * so check and adjust if necessary.
 		 */
-        dev_err(&client->dev, "DEEBUG ---------------- %s:%d hi don\n", __func__, __LINE__);
 		imx911_adjust_exposure_range(shared, ctrl);
 		break;
 
@@ -727,7 +724,6 @@ static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
 		 * as it doesn't set any registers. Don't do anything if the mode
 		 * already matches.
 		 */
-        dev_err(&client->dev, "DEEBUG ---------------- %s:%d hi don\n", __func__, __LINE__);
 		if (shared->mode && shared->mode->hdr != ctrl->val) {
 			code = imx911_get_format_code(shared);
 			get_mode_table(code, &mode_list, &num_modes, ctrl->val);
@@ -744,13 +740,12 @@ static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
     ret = 0;
 	switch (ctrl->id) {
 	case V4L2_CID_ANALOGUE_GAIN:
-        dev_err(&client->dev, "DEEBUG ---------------- %s:%d hi don\n", __func__, __LINE__);
 		imx911_set_analogue_gain(shared, ctrl->val);
 		break;
 	case V4L2_CID_EXPOSURE:
-        dev_err(&client->dev, "DEEBUG ---------------- %s:%d hi don\n", __func__, __LINE__);
 		ret = imx911_set_exposure(shared, ctrl->val);
 		break;
+
 	case V4L2_CID_DIGITAL_GAIN:
 	case V4L2_CID_TEST_PATTERN:
 	case V4L2_CID_TEST_PATTERN_RED:
@@ -762,25 +757,24 @@ static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
         break;
 
 	case V4L2_CID_VBLANK:
-        dev_err(&client->dev, "DEEBUG ---------------- %s:%d hi don\n", __func__, __LINE__);
 		ret = imx911_set_frame_length(shared,
 					      shared->mode->height + ctrl->val);
 		break;
+
 	case V4L2_CID_NOTIFY_GAINS:
 		break;
+
 	case V4L2_CID_WIDE_DYNAMIC_RANGE:
 		/* Already handled above. */
 		break;
+
 	default:
-        dev_err(&client->dev, "DEEBUG ---------------- %s:%d hi don\n", __func__, __LINE__);
-		dev_info(&client->dev,
+		dev_err(&client->dev,
 			 "ctrl(id:0x%x,val:0x%x) is not handled\n",
 			 ctrl->id, ctrl->val);
 		ret = -EINVAL;
 		break;
 	}
-
-    dev_err(&client->dev, "DEEBUG -------out------ %s:%d hi don\n", __func__, __LINE__);
 
 	return ret;
 }
@@ -3138,7 +3132,8 @@ static const struct v4l2_subdev_pad_ops tc358743_pad_ops = {
 static const struct v4l2_subdev_ops tc358743_ops = {
 	.core = &tc358743_core_ops,
 	.video = &tc358743_video_ops,
-	.pad = &tc358743_pad_ops,
+    //.pad = &tc358743_pad_ops,  //dwade
+	.pad = &imx911_pad_ops,
 };
 
 /* --------------- CUSTOM CTRLS --------------- */
