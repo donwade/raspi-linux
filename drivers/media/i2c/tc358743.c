@@ -58,7 +58,6 @@ enum pad_types {
 	NUM_PADS
 };
 
-static int debug = 1111;
 
 typedef struct {
 	struct tc358743_platform_data pdata;
@@ -136,7 +135,15 @@ typedef struct {
 
 }shared_t;
 
+
+
 shared_t *shared = NULL;  //tc3 and imx only use ONE alloc
+
+#define LINE(format, xarg...) v4l2_dbg(6, debug, &shared->sd, "%s:%d " format, __FUNCTION__, __LINE__, ## xarg);
+
+static int debug = 6;
+
+
 
 /*
  * Parameter to adjust Quad Bayer re-mosaic broken line correction
@@ -526,6 +533,17 @@ static void imx911_set_default_format(shared_t *imx911)
 	fmt->width = imx911->mode->width;
 	fmt->height = imx911->mode->height;
 	fmt->field = V4L2_FIELD_NONE;
+
+    fmt->colorspace = V4L2_COLORSPACE_RAW;
+    fmt->ycbcr_enc = V4L2_MAP_YCBCR_ENC_DEFAULT(fmt->colorspace);
+    fmt->quantization = V4L2_MAP_QUANTIZATION_DEFAULT(true,
+                              fmt->colorspace,
+                              fmt->ycbcr_enc);
+    fmt->xfer_func = V4L2_MAP_XFER_FUNC_DEFAULT(fmt->colorspace);
+    fmt->width = imx911->mode->width;
+    fmt->height = imx911->mode->height;
+    fmt->field = V4L2_FIELD_NONE;
+
 }
 
 static int imx911_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
@@ -572,16 +590,7 @@ static int imx911_set_exposure(shared_t *imx911, unsigned int val)
 {
 	val = max(val, imx911->mode->exposure_lines_min);
 	val -= val % imx911->mode->exposure_lines_step;
-
-#if 0
-	/*
-	 * In HDR mode this will set the longest exposure. The sensor
-	 * will automatically divide the medium and short ones by 4,16.
-	 */
-	return imx911_write_reg(imx911, IMX708_REG_EXPOSURE,
-				IMX708_REG_VALUE_16BIT,
-				val >> imx911->long_exp_shift);
-#endif
+    LINE("val = %d", val);
     return 0;
 }
 
@@ -592,122 +601,48 @@ static void imx911_adjust_exposure_range(shared_t *imx911,
     
     struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
 
-    dev_err(&client->dev, "DEEBUG ---- %s:%d -> %p %p %p\n",
-         __FUNCTION__ , __LINE__, imx911, ctrl, imx911->exposure );
-
-
-    dev_err(&client->dev, "DEEBUG -mid --- %s:%d -> %p\n",
-         __FUNCTION__ , __LINE__, imx911->mode );
-
 	/* Honour the VBLANK limits when setting exposure. */
 	exposure_max = imx911->mode->height + imx911->vblank->val -
 		IMX708_EXPOSURE_OFFSET;
 
-    dev_err(&client->dev, "DEEBUG -mid --- %s:%d -> %p %p %p\n",
-         __FUNCTION__ , __LINE__, imx911, ctrl, imx911->exposure );
-
-
 	exposure_def = min(exposure_max, imx911->exposure->val);
-	__v4l2_ctrl_modify_range(imx911->exposure, imx911->exposure->minimum,
-				 exposure_max, imx911->exposure->step,
-				 exposure_def);
 
-    dev_err(&client->dev, "DEEBUG -out--- %s:%d -> %p %p %p\n",
-         __FUNCTION__ , __LINE__, imx911, ctrl, imx911->exposure );
+    LINE("imx911->exposure=%d imx911->exposure->minimum=%d exposure_max=%d",
+        imx911->exposure->val, imx911->exposure->minimum, exposure_max);
+    LINE("imx911->step=%d exposure_def=%d",
+        imx911->exposure->step, exposure_def);
+
+	//__v4l2_ctrl_modify_range(imx911->exposure, imx911->exposure->minimum,
+	//			 exposure_max, imx911->exposure->step,
+	//			 exposure_def);
 
 }
 
 static int imx911_set_analogue_gain(shared_t *imx911, unsigned int val)
 {
-
-	/*
-	 * In HDR mode this will set the gain for the longest exposure,
-	 * and by default the sensor uses the same gain for all of them.
-	 */
-#if 0
-	int ret;
-	ret = imx911_write_reg(imx911, IMX708_REG_ANALOG_GAIN,
-			       IMX708_REG_VALUE_16BIT, val);
-
-	return ret;
-#endif
+    LINE("value = %d", val)
     return 0;
 }
 
 static int imx911_set_frame_length(shared_t *imx911, unsigned int val)
 {
-
-	imx911->long_exp_shift = 0;
-
-	while (val > IMX708_FRAME_LENGTH_MAX) {
-		imx911->long_exp_shift++;
-		val >>= 1;
-	}
-#if 0
-	int ret;
-	ret = imx911_write_reg(imx911, IMX708_REG_FRAME_LENGTH,
-			       IMX708_REG_VALUE_16BIT, val);
-	if (ret)
-		return ret;
-
-	return imx911_write_reg(imx911, IMX708_LONG_EXP_SHIFT_REG,
-				IMX708_REG_VALUE_08BIT, imx911->long_exp_shift);
-#endif
+    LINE("value = %d", val);
     return 0;
 }
 
 static void imx911_set_framing_limits(shared_t *imx911)
 {
-	const struct imx911_mode *mode = imx911->mode;
-	unsigned int hblank;
-	__v4l2_ctrl_modify_range(imx911->pixel_rate,
-				 mode->pixel_rate, mode->pixel_rate,
-				 1, mode->pixel_rate);
-
-	/* Update limits and set FPS to default */
-	__v4l2_ctrl_modify_range(imx911->vblank, mode->vblank_min,
-				 ((1 << IMX708_LONG_EXP_SHIFT_MAX) *
-					IMX708_FRAME_LENGTH_MAX) - mode->height,
-				 1, mode->vblank_default);
-
-	/*
-	 * Currently PPL is fixed to the mode specified value, so hblank
-	 * depends on mode->width only, and is not changeable in any
-	 * way other than changing the mode.
-	 */
-	hblank = mode->line_length_pix - mode->width;
-	__v4l2_ctrl_modify_range(imx911->hblank, hblank, hblank, 1, hblank);
+    LINE("nothing to report ", 0);
 }
 
 static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
 {
-
-//	v4l_dbg(1, debug, ctrl->client, "chip found @ 0x%x (%s)\n",
-//		client->addr << 1, client->adapter->name);
-    /**
-     * container_of - cast a member of a structure out to the containing structure
-     * @ptr:        the pointer to the member.
-     * @type:       the type of the container struct this is embedded in.
-     * @member:     the name of the member within the struct.
-     *
-     */
-
-    /*
-      #define container_of(ptr, type, member) ({              \
-        const typeof( ((type *)0)->member ) *__mptr = (ptr);  \
-        (type *)( (char *)__mptr - offsetof(type,member) );})
-    */
-
-
-	//shared_t *shared = container_of(ctrl->handler, shared_t, ctrl_handler);
 
 	struct i2c_client *client = v4l2_get_subdevdata(&shared->sd);
 
 	const struct imx911_mode *mode_list;
 	unsigned int code, num_modes;
 	int ret = 0;
-
-    dev_err(&client->dev, "DEEBUG  %s:%d -> id=%d 0x%X \n", __func__, __LINE__, ctrl->id, ctrl->id);
 
 	switch (ctrl->id) {
 	case V4L2_CID_VBLANK:
@@ -719,21 +654,7 @@ static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 
 	case V4L2_CID_WIDE_DYNAMIC_RANGE:
-		/*
-		 * The WIDE_DYNAMIC_RANGE control can also be applied immediately
-		 * as it doesn't set any registers. Don't do anything if the mode
-		 * already matches.
-		 */
-		if (shared->mode && shared->mode->hdr != ctrl->val) {
-			code = imx911_get_format_code(shared);
-			get_mode_table(code, &mode_list, &num_modes, ctrl->val);
-			shared->mode = v4l2_find_nearest_size(mode_list,
-							      num_modes,
-							      width, height,
-							      shared->mode->width,
-							      shared->mode->height);
-			imx911_set_framing_limits(shared);
-		}
+    	imx911_set_framing_limits(shared);
 		break;
 	}
 
@@ -754,6 +675,7 @@ static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_TEST_PATTERN_GREENB:
 	case V4L2_CID_HFLIP:
 	case V4L2_CID_VFLIP:
+        LINE("no implementation %d", ctrl->id);
         break;
 
 	case V4L2_CID_VBLANK:
@@ -762,16 +684,13 @@ static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 
 	case V4L2_CID_NOTIFY_GAINS:
-		break;
-
 	case V4L2_CID_WIDE_DYNAMIC_RANGE:
+        LINE("no implementation %d", ctrl->id);
 		/* Already handled above. */
 		break;
 
 	default:
-		dev_err(&client->dev,
-			 "ctrl(id:0x%x,val:0x%x) is not handled\n",
-			 ctrl->id, ctrl->val);
+        LINE("unknown request = %d", ctrl->id);
 		ret = -EINVAL;
 		break;
 	}
@@ -811,6 +730,8 @@ static void imx708_set_default_format(shared_t *shared)
 {
 	struct v4l2_mbus_framefmt *fmt = &shared->fmt;
 
+    LINE("%s", "hello");
+ 
 	/* Set default mode to max resolution */
 	shared->mode = &supported_modes_10bit_no_hdr[0];
 
@@ -1351,7 +1272,6 @@ MODULE_LICENSE("GPL v2");
  * reserved.
  */
 
-static int debug;
 module_param(debug, int, 0644);
 MODULE_PARM_DESC(debug, "debug level (0-3)");
 
@@ -1454,24 +1374,21 @@ static void i2c_wr(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
 		return;
 	}
 
-	if (debug < 3)
-		return;
-
 	switch (n) {
 	case 1:
-		v4l2_info(sd, "I2C write 0x%04x = 0x%02x",
+		v4l2_dbg(7, debug, sd, "I2C write 0x%04x = 0x%02x",
 				reg, data[2]);
 		break;
 	case 2:
-		v4l2_info(sd, "I2C write 0x%04x = 0x%02x%02x",
+		v4l2_dbg(7, debug, sd, "I2C write 0x%04x = 0x%02x%02x",
 				reg, data[3], data[2]);
 		break;
 	case 4:
-		v4l2_info(sd, "I2C write 0x%04x = 0x%02x%02x%02x%02x",
+		v4l2_dbg(7, debug, sd, "I2C write 0x%04x = 0x%02x%02x%02x%02x",
 				reg, data[5], data[4], data[3], data[2]);
 		break;
 	default:
-		v4l2_info(sd, "I2C write %d bytes from address 0x%04x\n",
+		v4l2_dbg(7, debug,sd, "I2C write %d bytes from address 0x%04x\n",
 				n, reg);
 	}
 }
@@ -1757,6 +1674,7 @@ static void print_avi_infoframe(struct v4l2_subdev *sd)
 static int tc358743_s_ctrl_detect_tx_5v(struct v4l2_subdev *sd)
 {
 	shared_t *tc3 = to_tc3(sd);
+    LINE("detecting 5v is %d", tx_5v_power_present(sd));
 
 	return v4l2_ctrl_s_ctrl(tc3->detect_tx_5v_ctrl,
 			tx_5v_power_present(sd));
@@ -1765,6 +1683,7 @@ static int tc358743_s_ctrl_detect_tx_5v(struct v4l2_subdev *sd)
 static int tc358743_s_ctrl_audio_sampling_rate(struct v4l2_subdev *sd)
 {
 	shared_t *tc3 = to_tc3(sd);
+    LINE("get_audio_sampling_rate = %d", get_audio_sampling_rate(sd));
 
 	return v4l2_ctrl_s_ctrl(tc3->audio_sampling_rate_ctrl,
 			get_audio_sampling_rate(sd));
@@ -1774,6 +1693,7 @@ static int tc358743_s_ctrl_audio_present(struct v4l2_subdev *sd)
 {
 	shared_t *tc3 = to_tc3(sd);
 
+    LINE("audio_present = %d", audio_present(sd));
 	return v4l2_ctrl_s_ctrl(tc3->audio_present_ctrl,
 			audio_present(sd));
 }
@@ -1786,6 +1706,7 @@ static int tc358743_update_controls(struct v4l2_subdev *sd)
 	ret |= tc358743_s_ctrl_audio_sampling_rate(sd);
 	ret |= tc358743_s_ctrl_audio_present(sd);
 
+    LINE("control update %s", ret?"FAIL":"PASS");
 	return ret;
 }
 
@@ -3118,6 +3039,16 @@ static const struct v4l2_subdev_video_ops tc358743_video_ops = {
 	.s_stream = tc358743_s_stream,
 };
 
+#if 0  // ref
+static const struct v4l2_subdev_pad_ops imx911_pad_ops = {
+	.enum_mbus_code = imx911_enum_mbus_code,
+	.get_fmt = imx911_get_pad_format,
+	.set_fmt = imx911_set_pad_format,
+	.get_selection = imx911_get_selection,
+	.enum_frame_size = imx911_enum_frame_size,
+};
+#endif
+
 static const struct v4l2_subdev_pad_ops tc358743_pad_ops = {
 	.enum_mbus_code = tc358743_enum_mbus_code,
 	.set_fmt = tc358743_set_fmt,
@@ -3324,6 +3255,7 @@ static inline int tc358743_probe_of(shared_t *tc3)
 }
 #endif
 
+
 static int tc358743_probe(struct i2c_client *client)
 {
 	static struct v4l2_dv_timings default_timing = V4L2_DV_BT_CEA_640X480P59_94;
@@ -3340,6 +3272,12 @@ static int tc358743_probe(struct i2c_client *client)
 
 	v4l_dbg(1, debug, client, "chip found @ 0x%x (%s)\n",
 		client->addr << 1, client->adapter->name);
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdate-time"
+	v4l_dbg(1, debug, client, "%s: built on %s %s\n", __FUNCTION__, __DATE__, __TIME__);
+#pragma GCC diagnostic pop
+
 
 	shared = devm_kzalloc(&client->dev, sizeof(shared_t),
 			GFP_KERNEL);
