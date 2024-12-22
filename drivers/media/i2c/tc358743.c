@@ -331,17 +331,17 @@ static const struct imx911_reg mode_hdr_regs[] = {
 };
 
 /* Mode configs. Keep separate lists for when HDR is enabled or not. */
-static const struct imx911_mode supported_modes_10bit_no_hdr[] = {
+static const struct imx911_mode supported_modes[] = {
 	{
 		/* Full resolution. */
-		.width = 4608,
-		.height = 2592,
+		.width = 1920,  //hdmi full
+		.height = 1080,
 		.line_length_pix = 0x3d20,
 		.crop = {
 			.left = IMX708_PIXEL_ARRAY_LEFT,
 			.top = IMX708_PIXEL_ARRAY_TOP,
-			.width = 4608,
-			.height = 2592,
+			.width = 1920,
+			.height = 1080,
 		},
 		.vblank_min = 58,
 		.vblank_default = 58,
@@ -357,14 +357,14 @@ static const struct imx911_mode supported_modes_10bit_no_hdr[] = {
 	},
 	{
 		/* regular 2x2 binned. */
-		.width = 2304,
-		.height = 1296,
+		.width = 1280,
+		.height = 720,
 		.line_length_pix = 0x1e90,
 		.crop = {
 			.left = IMX708_PIXEL_ARRAY_LEFT,
 			.top = IMX708_PIXEL_ARRAY_TOP,
-			.width = 4608,
-			.height = 2592,
+			.width = 1280,
+			.height = 720,
 		},
 		.vblank_min = 40,
 		.vblank_default = 1198,
@@ -378,55 +378,6 @@ static const struct imx911_mode supported_modes_10bit_no_hdr[] = {
 		.hdr = false,
 		.remosaic = false
 	},
-	{
-		/* 2x2 binned and cropped for 720p. */
-		.width = 1536,
-		.height = 864,
-		.line_length_pix = 0x1460,
-		.crop = {
-			.left = IMX708_PIXEL_ARRAY_LEFT + 768,
-			.top = IMX708_PIXEL_ARRAY_TOP + 432,
-			.width = 3072,
-			.height = 1728,
-		},
-		.vblank_min = 40,
-		.vblank_default = 2755,
-		.reg_list = {
-			.num_of_regs = ARRAY_SIZE(mode_2x2binned_720p_regs),
-			.regs = mode_2x2binned_720p_regs,
-		},
-		.pixel_rate = 566400000,
-		.exposure_lines_min = 4,
-		.exposure_lines_step = 2,
-		.hdr = false,
-		.remosaic = false
-	},
-};
-
-static const struct imx911_mode supported_modes_10bit_hdr[] = {
-	{
-		/* There's only one HDR mode, which is 2x2 downscaled */
-		.width = 2304,
-		.height = 1296,
-		.line_length_pix = 0x1460,
-		.crop = {
-			.left = IMX708_PIXEL_ARRAY_LEFT,
-			.top = IMX708_PIXEL_ARRAY_TOP,
-			.width = 4608,
-			.height = 2592,
-		},
-		.vblank_min = 3673,
-		.vblank_default = 3673,
-		.reg_list = {
-			.num_of_regs = ARRAY_SIZE(mode_hdr_regs),
-			.regs = mode_hdr_regs,
-		},
-		.pixel_rate = 777600000,
-		.exposure_lines_min = 8 * IMX708_HDR_EXPOSURE_RATIO * IMX708_HDR_EXPOSURE_RATIO,
-		.exposure_lines_step = 2 * IMX708_HDR_EXPOSURE_RATIO * IMX708_HDR_EXPOSURE_RATIO,
-		.hdr = true,
-		.remosaic = false
-	}
 };
 
 /*
@@ -489,14 +440,9 @@ static inline void get_mode_table(unsigned int code,
 	case MEDIA_BUS_FMT_SGRBG10_1X10:
 	case MEDIA_BUS_FMT_SGBRG10_1X10:
 	case MEDIA_BUS_FMT_SBGGR10_1X10:
-		if (hdr_enable) {
-			*mode_list = supported_modes_10bit_hdr;
-			*num_modes = ARRAY_SIZE(supported_modes_10bit_hdr);
-		} else {
-			*mode_list = supported_modes_10bit_no_hdr;
-			*num_modes = ARRAY_SIZE(supported_modes_10bit_no_hdr);
-		}
-		break;
+		*mode_list = supported_modes;
+		*num_modes = ARRAY_SIZE(supported_modes);
+	break;
 	default:
 		*mode_list = NULL;
 		*num_modes = 0;
@@ -521,7 +467,7 @@ static void imx911_set_default_format(shared_t *imx911)
 	struct v4l2_mbus_framefmt *fmt = &imx911->fmt;
 
 	/* Set default mode to max resolution */
-	imx911->mode = &supported_modes_10bit_no_hdr[0];
+	imx911->mode = &supported_modes[0];
 
 	/* fmt->code not set as it will always be computed based on flips */
 	fmt->colorspace = V4L2_COLORSPACE_RAW;
@@ -558,13 +504,8 @@ static int imx911_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 	mutex_lock(&imx911->mutex);
 
 	/* Initialize try_fmt for the image pad */
-	if (imx911->hdr_mode->val) {
-		try_fmt_img->width = supported_modes_10bit_hdr[0].width;
-		try_fmt_img->height = supported_modes_10bit_hdr[0].height;
-	} else {
-		try_fmt_img->width = supported_modes_10bit_no_hdr[0].width;
-		try_fmt_img->height = supported_modes_10bit_no_hdr[0].height;
-	}
+	try_fmt_img->width = supported_modes[0].width;
+	try_fmt_img->height = supported_modes[0].height;
 	try_fmt_img->code = imx911_get_format_code(imx911);
 	try_fmt_img->field = V4L2_FIELD_NONE;
 
@@ -733,7 +674,7 @@ static void imx708_set_default_format(shared_t *shared)
     LINE("%s", "hello");
  
 	/* Set default mode to max resolution */
-	shared->mode = &supported_modes_10bit_no_hdr[0];
+	shared->mode = &supported_modes[0];
 
 	/* fmt->code not set as it will always be computed based on flips */
 	fmt->colorspace = V4L2_COLORSPACE_RAW;
