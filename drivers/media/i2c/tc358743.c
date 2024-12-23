@@ -372,14 +372,13 @@ static inline void get_mode_table(unsigned int code,
 				  unsigned int *num_modes,
 				  bool hdr_enable)
 {
-    //MEDIA_BUS_FMT_UYVY8_1X16
-    //MEDIA_BUS_FMT_RGB888_1X24
 
     LINE("****** requesting dims via code = %d", code);
 	switch (code) {
 
     	/* 10-bit */
 #ifdef USE_LEGACY_PADS
+        case MEDIA_BUS_FMT_RGB888_1X24:
         case MEDIA_BUS_FMT_UYVY8_1X16:
 #else
     	case MEDIA_BUS_FMT_SRGGB10_1X10:
