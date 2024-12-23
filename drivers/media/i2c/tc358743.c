@@ -319,6 +319,13 @@ static const struct imx911_mode supported_modes[] = {
  * - v flip
  * - h&v flips
  */
+static const u32 legacy_imx_codes[] = {
+	/* 10-bit modes. */
+	MEDIA_BUS_FMT_SRGGB10_1X10,
+	MEDIA_BUS_FMT_SGRBG10_1X10,
+	MEDIA_BUS_FMT_SGBRG10_1X10,
+	MEDIA_BUS_FMT_SBGGR10_1X10,
+};
 static const u32 imx_codes[] = {
 	/* 10-bit modes. */
 	MEDIA_BUS_FMT_SRGGB10_1X10,
@@ -326,6 +333,7 @@ static const u32 imx_codes[] = {
 	MEDIA_BUS_FMT_SGBRG10_1X10,
 	MEDIA_BUS_FMT_SBGGR10_1X10,
 };
+
 
 static const char * const imx911_test_pattern_menu[] = {
 	"Disabled",
@@ -364,14 +372,21 @@ static inline void get_mode_table(unsigned int code,
 				  unsigned int *num_modes,
 				  bool hdr_enable)
 {
-    LINE("requesting dims via code = %d", code);
+    //MEDIA_BUS_FMT_UYVY8_1X16
+    //MEDIA_BUS_FMT_RGB888_1X24
+
+    LINE("****** requesting dims via code = %d", code);
 	switch (code) {
 
     	/* 10-bit */
+#ifdef USE_LEGACY_PADS
+        case MEDIA_BUS_FMT_UYVY8_1X16:
+#else
     	case MEDIA_BUS_FMT_SRGGB10_1X10:
     	case MEDIA_BUS_FMT_SGRBG10_1X10:
     	case MEDIA_BUS_FMT_SGBRG10_1X10:
     	case MEDIA_BUS_FMT_SBGGR10_1X10:
+#endif
     		*mode_list = supported_modes;
     		*num_modes = ARRAY_SIZE(supported_modes);
     	break;
@@ -3329,6 +3344,7 @@ static int tc358743_probe(struct i2c_client *client)
 
 #ifdef USE_LEGACY_PADS
     #define PAD_CNT 1
+    LINE("USING LEGACY PADS (MEDIA_ENT_F_VID_IF_BRIDGE) ");
     shared->pad[IMAGE_PAD].flags = MEDIA_PAD_FL_SOURCE;
 
     sd->entity.function = MEDIA_ENT_F_VID_IF_BRIDGE;
@@ -3337,6 +3353,7 @@ static int tc358743_probe(struct i2c_client *client)
         goto err_hdl;
 #else
     #define PAD_CNT 2
+    LINE("USING IMX PADS (MEDIA_ENT_F_CAM_SENSOR) ");
     shared->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE | V4L2_SUBDEV_FL_HAS_EVENTS;
     shared->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
 
