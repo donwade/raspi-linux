@@ -156,31 +156,13 @@ MODULE_PARM_DESC(qbc_adjust, "Quad Bayer broken line correction strength [0,2-5]
 #define IMX708_REG_VALUE_08BIT		1
 #define IMX708_REG_VALUE_16BIT		2
 
-/* Chip ID */
-#define IMX708_REG_CHIP_ID		0x0016
-#define IMX708_CHIP_ID			0x0708
-
-#define IMX708_REG_MODE_SELECT		0x0100
-#define IMX708_MODE_STANDBY		0x00
-#define IMX708_MODE_STREAMING		0x01
-
-#define IMX708_REG_ORIENTATION		0x101
-
-#define IMX708_INCLK_FREQ		24000000
-
 /* Default initial pixel rate, will get updated for each mode. */
 #define IMX708_INITIAL_PIXEL_RATE	590000000
 
 /* V_TIMING internal */
-#define IMX708_REG_FRAME_LENGTH		0x0340
 #define IMX708_FRAME_LENGTH_MAX		0xffff
 
-/* Long exposure multiplier */
-#define IMX708_LONG_EXP_SHIFT_MAX	7
-#define IMX708_LONG_EXP_SHIFT_REG	0x3100
-
 /* Exposure control */
-#define IMX708_REG_EXPOSURE		0x0202
 #define IMX708_EXPOSURE_OFFSET		48
 #define IMX708_EXPOSURE_DEFAULT		0x640
 #define IMX708_EXPOSURE_STEP		1
@@ -189,22 +171,17 @@ MODULE_PARM_DESC(qbc_adjust, "Quad Bayer broken line correction strength [0,2-5]
 					 IMX708_EXPOSURE_OFFSET)
 
 /* Analog gain control */
-#define IMX708_REG_ANALOG_GAIN		0x0204
 #define IMX708_ANA_GAIN_MIN		112
 #define IMX708_ANA_GAIN_MAX		960
 #define IMX708_ANA_GAIN_STEP		1
 #define IMX708_ANA_GAIN_DEFAULT	   IMX708_ANA_GAIN_MIN
 
 /* Digital gain control */
-#define IMX708_REG_DIGITAL_GAIN		0x020e
-#define IMX708_DGTL_GAIN_MIN		0x0100
 #define IMX708_DGTL_GAIN_MAX		0xffff
 #define IMX708_DGTL_GAIN_DEFAULT	0x0100
 #define IMX708_DGTL_GAIN_STEP		1
 
 /* Colour balance controls */
-#define IMX708_REG_COLOUR_BALANCE_RED   0x0b90
-#define IMX708_REG_COLOUR_BALANCE_BLUE	0x0b92
 #define IMX708_COLOUR_BALANCE_MIN	0x01
 #define IMX708_COLOUR_BALANCE_MAX	0xffff
 #define IMX708_COLOUR_BALANCE_STEP	0x01
@@ -219,29 +196,9 @@ MODULE_PARM_DESC(qbc_adjust, "Quad Bayer broken line correction strength [0,2-5]
 #define IMX708_TEST_PATTERN_PN9		4
 
 /* Test pattern colour components */
-#define IMX708_REG_TEST_PATTERN_R	0x0602
-#define IMX708_REG_TEST_PATTERN_GR	0x0604
-#define IMX708_REG_TEST_PATTERN_B	0x0606
-#define IMX708_REG_TEST_PATTERN_GB	0x0608
 #define IMX708_TEST_PATTERN_COLOUR_MIN	0
 #define IMX708_TEST_PATTERN_COLOUR_MAX	0x0fff
 #define IMX708_TEST_PATTERN_COLOUR_STEP	1
-
-#define IMX708_REG_BASE_SPC_GAINS_L	0x7b10
-#define IMX708_REG_BASE_SPC_GAINS_R	0x7c00
-
-/* HDR exposure ratio (long:med == med:short) */
-#define IMX708_HDR_EXPOSURE_RATIO       4
-#define IMX708_REG_MID_EXPOSURE		0x3116
-#define IMX708_REG_SHT_EXPOSURE		0x0224
-#define IMX708_REG_MID_ANALOG_GAIN	0x3118
-#define IMX708_REG_SHT_ANALOG_GAIN	0x0216
-
-/* QBC Re-mosaic broken line correction registers */
-#define IMX708_LPF_INTENSITY_EN		0xC428
-#define IMX708_LPF_INTENSITY_ENABLED	0x00
-#define IMX708_LPF_INTENSITY_DISABLED	0x01
-#define IMX708_LPF_INTENSITY		0xC429
 
 /*
  * Metadata buffer holds a variety of data, all sent with the same VC/DT (0x12).
@@ -253,12 +210,14 @@ MODULE_PARM_DESC(qbc_adjust, "Quad Bayer broken line correction strength [0,2-5]
 #define IMX708_NUM_EMBEDDED_LINES 1
 
 /* IMX708 native and active pixel array size. */
-#define IMX708_NATIVE_WIDTH		4640U
-#define IMX708_NATIVE_HEIGHT		2658U
+#define IMX708_NATIVE_WIDTH		    1920U
+#define IMX708_NATIVE_HEIGHT		1080U
+
 #define IMX708_PIXEL_ARRAY_LEFT		16U
 #define IMX708_PIXEL_ARRAY_TOP		24U
-#define IMX708_PIXEL_ARRAY_WIDTH	4608U
-#define IMX708_PIXEL_ARRAY_HEIGHT	2592U
+
+#define IMX708_PIXEL_ARRAY_WIDTH	1920U
+#define IMX708_PIXEL_ARRAY_HEIGHT	1080U
 
 struct imx911_reg {
 	u16 address;
@@ -309,28 +268,7 @@ struct imx911_mode {
 	bool remosaic;
 };
 
-static const struct imx911_reg mode_common_regs[] = {
-	{0x0100, 0x00},
-};
 
-/* 10-bit. */
-static const struct imx911_reg mode_4608x2592_regs[] = {
-	{0x0342, 0x3D},
-};
-
-static const struct imx911_reg mode_2x2binned_regs[] = {
-	{0x0342, 0x1E},
-};
-
-static const struct imx911_reg mode_2x2binned_720p_regs[] = {
-	{0x0342, 0x14},
-};
-
-static const struct imx911_reg mode_hdr_regs[] = {
-	{0x0342, 0x14},
-};
-
-/* Mode configs. Keep separate lists for when HDR is enabled or not. */
 static const struct imx911_mode supported_modes[] = {
 	{
 		/* Full resolution. */
@@ -345,10 +283,6 @@ static const struct imx911_mode supported_modes[] = {
 		},
 		.vblank_min = 58,
 		.vblank_default = 58,
-		.reg_list = {
-			.num_of_regs = ARRAY_SIZE(mode_4608x2592_regs),
-			.regs = mode_4608x2592_regs,
-		},
 		.pixel_rate = 595200000,
 		.exposure_lines_min = 8,
 		.exposure_lines_step = 1,
@@ -368,10 +302,6 @@ static const struct imx911_mode supported_modes[] = {
 		},
 		.vblank_min = 40,
 		.vblank_default = 1198,
-		.reg_list = {
-			.num_of_regs = ARRAY_SIZE(mode_2x2binned_regs),
-			.regs = mode_2x2binned_regs,
-		},
 		.pixel_rate = 585600000,
 		.exposure_lines_min = 4,
 		.exposure_lines_step = 2,
@@ -434,18 +364,23 @@ static inline void get_mode_table(unsigned int code,
 				  unsigned int *num_modes,
 				  bool hdr_enable)
 {
+    LINE("requesting dims via code = %d", code);
 	switch (code) {
-	/* 10-bit */
-	case MEDIA_BUS_FMT_SRGGB10_1X10:
-	case MEDIA_BUS_FMT_SGRBG10_1X10:
-	case MEDIA_BUS_FMT_SGBRG10_1X10:
-	case MEDIA_BUS_FMT_SBGGR10_1X10:
-		*mode_list = supported_modes;
-		*num_modes = ARRAY_SIZE(supported_modes);
-	break;
-	default:
-		*mode_list = NULL;
-		*num_modes = 0;
+
+    	/* 10-bit */
+    	case MEDIA_BUS_FMT_SRGGB10_1X10:
+    	case MEDIA_BUS_FMT_SGRBG10_1X10:
+    	case MEDIA_BUS_FMT_SGBRG10_1X10:
+    	case MEDIA_BUS_FMT_SBGGR10_1X10:
+    		*mode_list = supported_modes;
+    		*num_modes = ARRAY_SIZE(supported_modes);
+    	break;
+
+    	default:
+            LINE("bad mode requested %d", code);
+    		*mode_list = NULL;
+    		*num_modes = 0;
+        break;
 	}
 }
 
@@ -548,9 +483,10 @@ static void imx911_adjust_exposure_range(shared_t *imx911,
 
 	exposure_def = min(exposure_max, imx911->exposure->val);
 
-    LINE("imx911->exposure=%d imx911->exposure->minimum=%d exposure_max=%d",
-        imx911->exposure->val, imx911->exposure->minimum, exposure_max);
-    LINE("imx911->step=%d exposure_def=%d",
+    //LINE("imx911->exposure=%lld imx911->exposure->minimum=%lld exposure_max=%d",
+    //    imx911->exposure->val, imx911->exposure->minimum, exposure_max);
+
+    LINE("imx911->step=%lld exposure_def=%d",
         imx911->exposure->step, exposure_def);
 
 	//__v4l2_ctrl_modify_range(imx911->exposure, imx911->exposure->minimum,
@@ -573,7 +509,7 @@ static int imx911_set_frame_length(shared_t *imx911, unsigned int val)
 
 static void imx911_set_framing_limits(shared_t *imx911)
 {
-    LINE("nothing to report ", 0);
+    LINE("nothing to report ");
 }
 
 static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
@@ -729,6 +665,7 @@ static int imx911_enum_frame_size(struct v4l2_subdev *sd,
 
 static void imx911_reset_colorspace(struct v4l2_mbus_framefmt *fmt)
 {
+    LINE("reset color ... why");
 	fmt->colorspace = V4L2_COLORSPACE_RAW;
 	fmt->ycbcr_enc = V4L2_MAP_YCBCR_ENC_DEFAULT(fmt->colorspace);
 	fmt->quantization = V4L2_MAP_QUANTIZATION_DEFAULT(true,
@@ -741,6 +678,7 @@ static void imx911_update_image_pad_format(shared_t *imx911,
 					   const struct imx911_mode *mode,
 					   struct v4l2_subdev_format *fmt)
 {
+    LINE ("updating pads w=%d h=%d", mode->width, mode->height);
 	fmt->format.width = mode->width;
 	fmt->format.height = mode->height;
 	fmt->format.field = V4L2_FIELD_NONE;
@@ -1028,10 +966,6 @@ static int imx911_init_controls(shared_t *imx911)
 	v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
 			  IMX708_ANA_GAIN_MIN, IMX708_ANA_GAIN_MAX,
 			  IMX708_ANA_GAIN_STEP, IMX708_ANA_GAIN_DEFAULT);
-
-	v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops, V4L2_CID_DIGITAL_GAIN,
-			  IMX708_DGTL_GAIN_MIN, IMX708_DGTL_GAIN_MAX,
-			  IMX708_DGTL_GAIN_STEP, IMX708_DGTL_GAIN_DEFAULT);
 
 	imx911->hflip = v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
 					  V4L2_CID_HFLIP, 0, 1, 1, 0);
@@ -3332,9 +3266,6 @@ static int tc358743_probe(struct i2c_client *client)
               IMX708_ANA_GAIN_MIN, IMX708_ANA_GAIN_MAX,
               IMX708_ANA_GAIN_STEP, IMX708_ANA_GAIN_DEFAULT);
 
-    v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops, V4L2_CID_DIGITAL_GAIN,
-              IMX708_DGTL_GAIN_MIN, IMX708_DGTL_GAIN_MAX,
-              IMX708_DGTL_GAIN_STEP, IMX708_DGTL_GAIN_DEFAULT);
 
     shared->hflip = v4l2_ctrl_new_std(ctrl_hdlr, &imx911_ctrl_ops,
                       V4L2_CID_HFLIP, 0, 1, 1, 0);
