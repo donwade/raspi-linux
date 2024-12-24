@@ -2061,6 +2061,10 @@ static int tc358743_probe(struct i2c_client *client)
 	v4l_dbg(1, debug, client, "chip found @ 0x%x (%s)\n",
 		client->addr << 1, client->adapter->name);
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdate-time"
+	v4l_dbg(1, debug, client, "%s: built on %s %s\n", __FUNCTION__, __DATE__, __TIME__);
+#pragma GCC diagnostic pop
 	tc3 = devm_kzalloc(&client->dev, sizeof(struct tc358743_state),
 			GFP_KERNEL);
 	if (!tc3)
