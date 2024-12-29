@@ -25,6 +25,9 @@
 #include <media/v4l2-fh.h>
 #include <media/v4l2-ioctl.h>
 
+#include <uapi/linux/videodev2.h>  // me bad
+
+
 #if defined(CONFIG_VIDEO_V4L2_SUBDEV_API)
 /*
  * The Streams API is an experimental feature. To use the Streams API, set
@@ -469,11 +472,104 @@ static struct v4l2_subdev_state *
 subdev_ioctl_get_state(struct v4l2_subdev *sd, struct v4l2_subdev_fh *subdev_fh,
 		       unsigned int cmd, void *arg)
 {
+
+/*
+#define _IOC_DIR(nr)		(((nr) >> _IOC_DIRSHIFT) & _IOC_DIRMASK)
+#define _IOC_TYPE(nr)		(((nr) >> _IOC_TYPESHIFT) & _IOC_TYPEMASK)
+#define _IOC_NR(nr)		(((nr) >> _IOC_NRSHIFT) & _IOC_NRMASK)
+#define _IOC_SIZE(nr)		(((nr) >> _IOC_SIZESHIFT) & _IOC_SIZEMASK)
+*/
 	u32 which;
+    switch(cmd)
+    {
+        default:
+            pr_info("DIR=%d TYPE=%d *NR=%d SIZE=%d", 
+                _IOC_DIR(cmd), 
+                _IOC_TYPE(cmd), 
+                _IOC_NR(cmd), 
+                _IOC_SIZE(cmd));
+            
+            pr_info("%s:%d unknown subdev cmd = %d 0x%X ", __FUNCTION__, __LINE__, cmd, cmd);
+            break;
+    
+        //#include <uapi/linux/videodev2.h>  // me bad
+        case VIDIOC_S_EDID:
+            pr_info("VIDIOC_S_EDID");
+            break;
+
+        case VIDIOC_G_EDID:
+             pr_info("VIDIOC_G_EDID");
+            break;
+
+        case VIDIOC_G_PARM:
+            pr_info("VIDIOC_G_PARM");
+            break;
+
+        case VIDIOC_DV_TIMINGS_CAP:
+            pr_info("VIDIOC_DV_TIMINGS_CAP ");
+            break;
+
+        case VIDIOC_QUERY_EXT_CTRL:
+            pr_info("VIDIOC_QUERY_EXT_CTRL");
+            break;
+
+        case VIDIOC_QUERYCTRL:
+            pr_info("VIDIOC_QUERYCTRL");
+            break;
+
+        case VIDIOC_QUERY_DV_TIMINGS:
+            pr_info("VIDIOC_QUERY_DV_TIMINGS");
+            break;
+
+        case VIDIOC_SUBDEV_G_FMT:
+            pr_info("VIDIOC_SUBDEV_G_FMT: ");
+            break;
+
+        case VIDIOC_SUBDEV_S_FMT:
+           pr_info(" VIDIOC_SUBDEV_S_FMT ");
+            break;
+
+        case VIDIOC_SUBDEV_G_CROP:
+           pr_info(" VIDIOC_SUBDEV_G_CRO ");
+            break;
+
+        case VIDIOC_SUBDEV_S_CROP:
+            pr_info(" VIDIOC_SUBDEV_S_CROP: ");
+            break;
+
+        case VIDIOC_SUBDEV_ENUM_MBUS_CODE:
+            pr_info(" VIDIOC_SUBDEV_ENUM_MBUS_CODE: ");
+            break;
+
+        case VIDIOC_SUBDEV_ENUM_FRAME_SIZE:
+            pr_info(" VIDIOC_SUBDEV_ENUM_FRAME_SIZE: ");
+            break;
+
+        case VIDIOC_SUBDEV_ENUM_FRAME_INTERVAL:
+            pr_info(" VIDIOC_SUBDEV_ENUM_FRAME_INTERVAL: ");
+            break;
+
+        case VIDIOC_SUBDEV_G_SELECTION:
+            pr_info(" VIDIOC_SUBDEV_G_SELECTION: ");
+            break;
+
+        case VIDIOC_SUBDEV_S_SELECTION:
+            pr_info(" VIDIOC_SUBDEV_S_SELECTION: ");
+            break;
+
+        case VIDIOC_SUBDEV_G_ROUTING:
+            pr_info(" VIDIOC_SUBDEV_G_ROUTING: ");
+            break;
+
+        case VIDIOC_SUBDEV_S_ROUTING:
+            pr_info(" VIDIOC_SUBDEV_S_ROUTING: ");
+            break;
+    }
 
 	switch (cmd) {
 	default:
 		return NULL;
+
 	case VIDIOC_SUBDEV_G_FMT:
 	case VIDIOC_SUBDEV_S_FMT:
 		which = ((struct v4l2_subdev_format *)arg)->which;
@@ -720,10 +816,13 @@ static long subdev_do_ioctl(struct file *file, unsigned int cmd, void *arg,
 
 	case VIDIOC_SUBDEV_ENUM_MBUS_CODE: {
 		struct v4l2_subdev_mbus_code_enum *code = arg;
-
+        
+		pr_info("%s:%d VIDIOC_SUBDEV_ENUM_MBUS_CODE with code =%d (0x%X) ", __FUNCTION__, __LINE__, code->which, code->which);
 		if (!client_supports_streams)
+        {
+            pr_warn("%s:%d doesn't support streams?", __FUNCTION__, __LINE__);
 			code->stream = 0;
-
+        }
 		memset(code->reserved, 0, sizeof(code->reserved));
 		return v4l2_subdev_call(sd, pad, enum_mbus_code, state,
 					code);
