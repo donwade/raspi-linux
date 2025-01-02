@@ -493,6 +493,19 @@ subdev_ioctl_get_state(struct v4l2_subdev *sd, struct v4l2_subdev_fh *subdev_fh,
             break;
     
         //#include <uapi/linux/videodev2.h>  // me bad
+
+        case VIDIOC_G_EXT_CTRLS:
+            pr_info("VIDIOC_G_EXT_CTRLS");
+        break;
+
+        case VIDIOC_S_EXT_CTRLS: //imx708
+            pr_info("VIDIOC_S_EXT_CTRLS ");
+            break;
+
+        case VIDIOC_QUERYMENU:
+            pr_info("VIDIOC_QUERYMENU"); //ims708
+            break;
+
         case VIDIOC_S_EDID:
             pr_info("VIDIOC_S_EDID");
             break;
@@ -817,12 +830,16 @@ static long subdev_do_ioctl(struct file *file, unsigned int cmd, void *arg,
 	case VIDIOC_SUBDEV_ENUM_MBUS_CODE: {
 		struct v4l2_subdev_mbus_code_enum *code = arg;
         
-		pr_info("%s:%d VIDIOC_SUBDEV_ENUM_MBUS_CODE with code =%d (0x%X) ", __FUNCTION__, __LINE__, code->which, code->which);
+		pr_warn("%s:%d VIDIOC_SUBDEV_ENUM_MBUS_CODE with code =%d (0x%X) ", __FUNCTION__, __LINE__, code->which, code->which);
 		if (!client_supports_streams)
         {
             pr_warn("%s:%d doesn't support streams?", __FUNCTION__, __LINE__);
 			code->stream = 0;
         }
+        pr_warn("pad=%d index=%d code=%d which=%d flags=0x%X stream=%d", 
+                 code->pad, code->index, code->code,
+                 code->which, code->flags, code->stream);
+
 		memset(code->reserved, 0, sizeof(code->reserved));
 		return v4l2_subdev_call(sd, pad, enum_mbus_code, state,
 					code);

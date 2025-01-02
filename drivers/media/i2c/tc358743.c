@@ -1660,11 +1660,14 @@ static int tc358743_enum_mbus_code(struct v4l2_subdev *sd,
 	switch (code->index) {
 	case 0:
 		code->code = MEDIA_BUS_FMT_RGB888_1X24;
+        pr_warn("%s:%d index %d return MEDIA_BUS_FMT_RGB888_1X24", __FUNCTION__, __LINE__, code->index);
 		break;
 	case 1:
 		code->code = MEDIA_BUS_FMT_UYVY8_1X16;
+        pr_warn("%s:%d index %d return MEDIA_BUS_FMT_UYVY8_1X16", __FUNCTION__, __LINE__, code->index);
 		break;
 	default:
+        pr_warn("%s:%d index %d not valid", __FUNCTION__, __LINE__, code->index);
 		return -EINVAL;
 	}
 	return 0;
@@ -1682,14 +1685,51 @@ static u32 tc358743_g_colorspace(u32 code)
 	}
 }
 
+/*
+HD		1280x720		
+Full HD	1920x1080		
+QHD+	3200x1800		
+6K		6144x3160		
+16K		15360x8640	
+UHD/4K	3840x2160
+8K		7680x4320
+*/
+static int tc358743_enum_frame_size (struct v4l2_subdev *sd,
+       struct v4l2_subdev_state *state,
+       struct v4l2_subdev_frame_size_enum *fse)
+{
+	struct tc358743_state *tc3 = to_state(sd);
+
+    pr_warn("%s:%d s=%d p=%d i=%d c=%d",
+         __FUNCTION__, __LINE__,
+         fse->stream, fse->pad, fse->index, fse->code);
+
+    fse->min_width = 1920;
+    fse->max_width = 1920;
+    fse->min_height = 1080;
+    fse->max_height = 1080;
+
+    pr_warn("%s:%d w=%d/%d h=%d/%d",
+         __FUNCTION__, __LINE__,
+         fse->min_width, fse->max_width, fse->min_height, fse->max_height);
+
+    return fse->index < 2 ? 0 : -EINVAL;
+}
+
+
+
 static int tc358743_get_fmt(struct v4l2_subdev *sd,
 		struct v4l2_subdev_state *sd_state,
 		struct v4l2_subdev_format *format)
 {
 	struct tc358743_state *tc3 = to_state(sd);
+    pr_warn("%s:%d getting format", __FUNCTION__, __LINE__);
 
 	if (format->pad != 0)
+    {
+        pr_warn("%s:%d STOP pad must be zero!!!", __FUNCTION__, __LINE__);
 		return -EINVAL;
+    }
 
 	format->format.code = tc3->mbus_fmt_code;
 	format->format.width = tc3->timings.bt.width;
@@ -1697,6 +1737,13 @@ static int tc358743_get_fmt(struct v4l2_subdev *sd,
 	format->format.field = V4L2_FIELD_NONE;
 
 	format->format.colorspace = tc358743_g_colorspace(format->format.code);
+
+    pr_warn("%s:%d code=%d width=%d height=%d color=%d getting format",
+        __FUNCTION__,__LINE__,
+        format->format.code,
+        format->format.width,
+        format->format.height,
+        format->format.colorspace);
 
 	return 0;
 }
@@ -1837,8 +1884,10 @@ static const struct v4l2_subdev_video_ops tc358743_video_ops = {
 	.s_stream = tc358743_s_stream,
 };
 
+
 static const struct v4l2_subdev_pad_ops tc358743_pad_ops = {
 	.enum_mbus_code = tc358743_enum_mbus_code,
+    .enum_frame_size = tc358743_enum_frame_size,
 	.set_fmt = tc358743_set_fmt,
 	.get_fmt = tc358743_get_fmt,
 	.get_edid = tc358743_g_edid,
