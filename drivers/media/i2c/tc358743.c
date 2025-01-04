@@ -73,7 +73,9 @@ struct tc358743_state {
 	struct tc358743_platform_data pdata;
 	struct v4l2_mbus_config_mipi_csi2 bus;
 	struct v4l2_subdev sd;
-	struct media_pad pad;
+	struct media_pad pad;   
+    
+	struct v4l2_rect r;
 	struct v4l2_ctrl_handler hdl;
 	struct i2c_client *i2c_client;
 	/* CONFCTL is modified in ops and tc358743_hdmi_sys_int_handler */
@@ -1884,6 +1886,29 @@ static const struct v4l2_subdev_video_ops tc358743_video_ops = {
 	.s_stream = tc358743_s_stream,
 };
 
+int tc358743_get_selection(struct v4l2_subdev *sd,
+             struct v4l2_subdev_state *state,
+             struct v4l2_subdev_selection *sel)
+{
+	struct tc358743_state *tc3 = to_state(sd);
+    sel->r = tc3->r;
+    pr_warn("%s:%d  GET rectangle TL=[%d,%d] DM=[%d,%d]",
+        __FUNCTION__, __LINE__, sel->r.left, sel->r.top, sel->r.width, sel->r.height);
+    return 0;    
+};
+
+
+int tc358743_set_selection(struct v4l2_subdev *sd,
+             struct v4l2_subdev_state *state,
+             struct v4l2_subdev_selection *sel)
+{
+	struct tc358743_state *tc3 = to_state(sd);
+    tc3->r = sel->r;
+    pr_warn("%s:%d  SET rectangle TL=[%d,%d] DM=[%d,%d]",
+        __FUNCTION__, __LINE__, sel->r.left, sel->r.top, sel->r.width, sel->r.height);
+    return 0;
+};
+
 
 static const struct v4l2_subdev_pad_ops tc358743_pad_ops = {
 	.enum_mbus_code = tc358743_enum_mbus_code,
@@ -1892,6 +1917,9 @@ static const struct v4l2_subdev_pad_ops tc358743_pad_ops = {
 	.get_fmt = tc358743_get_fmt,
 	.get_edid = tc358743_g_edid,
 	.set_edid = tc358743_s_edid,
+    .get_selection = tc358743_get_selection,
+    .set_selection = tc358743_set_selection,
+
 	.enum_dv_timings = tc358743_enum_dv_timings,
 	.dv_timings_cap = tc358743_dv_timings_cap,
 	.get_mbus_config = tc358743_get_mbus_config,
