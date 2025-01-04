@@ -6,7 +6,7 @@
  * reserved.
  */
 
-/*
+/* 
  * References (c = chapter, p = page):
  * REF_01 - Toshiba, TC358743XBG (H2C), Functional Specification, Rev 0.60
  * REF_02 - Toshiba, TC358743XBG_HDMI-CSI_Tv11p_nm.xls
