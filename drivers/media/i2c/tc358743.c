@@ -16,6 +16,94 @@
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-subdev.h>
 
+
+//---------------------------------------
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/i2c.h>
+#include <linux/clk.h>
+#include <linux/delay.h>
+#include <linux/gpio/consumer.h>
+#include <linux/interrupt.h>
+#include <linux/timer.h>
+#include <linux/of_graph.h>
+#include <linux/videodev2.h>
+#include <linux/workqueue.h>
+#include <linux/v4l2-dv-timings.h>
+#include <linux/hdmi.h>
+#include <media/cec.h>
+#include <media/v4l2-dv-timings.h>
+#include <media/v4l2-device.h>
+#include <media/v4l2-ctrls.h>
+#include <media/v4l2-event.h>
+#include <media/v4l2-fwnode.h>
+#include <media/i2c/tc358743.h>
+
+#include "tc358743_regs.h"
+
+
+struct tc358743_state {
+    struct tc358743_platform_data pdata;
+    struct v4l2_mbus_config_mipi_csi2 bus;
+    struct v4l2_subdev sd;
+    struct media_pad pad;
+    struct v4l2_ctrl_handler hdl;
+    struct i2c_client *i2c_client;
+
+    /* CONFCTL is modified in ops and tc358743_hdmi_sys_int_handler */
+    struct mutex mutex;
+
+    /* controls */
+    struct v4l2_ctrl *detect_tx_5v_ctrl;
+    struct v4l2_ctrl *audio_sampling_rate_ctrl;
+    struct v4l2_ctrl *audio_present_ctrl;
+
+    struct delayed_work delayed_work_enable_hotplug;
+
+    struct timer_list timer;
+    struct work_struct work_i2c_poll;
+
+    /* edid  */
+    u8 edid_blocks_written;
+
+    struct v4l2_dv_timings timings;
+    u32 mbus_fmt_code;
+    u8 csi_lanes_in_use;
+
+    struct gpio_desc *reset_gpio;
+
+    struct cec_adapter *cec_adap;
+
+    //-----------------------------------------
+
+	struct device *dev_911;
+	bool streaming_911;
+	u32 vblank_911;
+	unsigned long menu_skip_mask_911;
+	u32 cur_code_911;
+	const struct imx911_mode *cur_mode_911;
+	struct v4l2_ctrl_handler ctrl_handler_911;
+	struct v4l2_ctrl *link_freq_ctrl_911;
+	struct v4l2_ctrl *pclk_ctrl_911;
+	struct v4l2_ctrl *hblank_ctrl_911;
+	struct v4l2_ctrl *vblank_ctrl_911;
+	struct {
+		struct v4l2_ctrl *exp_ctrl_911;
+		struct v4l2_ctrl *again_ctrl_911;
+	};
+
+    //-----------------------------------------
+};
+
+static inline struct tc358743_state *to_state(struct v4l2_subdev *sd)
+{
+	return container_of(sd, struct tc358743_state, sd);
+}
+
+
+//---------------------------------------
+
 /* Streaming Mode */
 #define IMX334_REG_MODE_SELECT	0x3000
 #define IMX334_MODE_STANDBY	0x01
@@ -123,27 +211,11 @@ struct imx911_mode {
  * @streaming: Flag indicating streaming state
  */
 struct imx911 {
-	struct device *dev;
 	struct i2c_client *client;
 	struct v4l2_subdev sd;
 	struct media_pad pad;
 	struct gpio_desc *reset_gpio;
 	struct clk *inclk;
-	struct v4l2_ctrl_handler ctrl_handler;
-	struct v4l2_ctrl *link_freq_ctrl;
-	struct v4l2_ctrl *pclk_ctrl;
-	struct v4l2_ctrl *hblank_ctrl;
-	struct v4l2_ctrl *vblank_ctrl;
-	struct {
-		struct v4l2_ctrl *exp_ctrl;
-		struct v4l2_ctrl *again_ctrl;
-	};
-	u32 vblank;
-	const struct imx911_mode *cur_mode;
-	struct mutex mutex;
-	unsigned long menu_skip_mask;
-	u32 cur_code;
-	bool streaming;
 };
 
 static const s64 link_freq[] = {
@@ -502,7 +574,7 @@ static inline struct imx911 *to_imx911(struct v4l2_subdev *subdev)
  *
  * Return: 0 if successful, error code otherwise.
  */
-static int imx911_read_reg(struct imx911 *imx911, u16 reg, u32 len, u32 *val)
+static int imx911_read_reg(struct tc358743_state *imx911, u16 reg, u32 len, u32 *val)
 {
 	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
 	struct i2c_msg msgs[2] = {0};
@@ -547,19 +619,8 @@ static int imx911_read_reg(struct imx911 *imx911, u16 reg, u32 len, u32 *val)
  *
  * Return: 0 if successful, error code otherwise.
  */
-static int imx911_write_reg(struct imx911 *imx911, u16 reg, u32 len, u32 val)
+static int imx911_write_reg(struct tc358743_state *imx911, u16 reg, u32 len, u32 val)
 {
-	struct i2c_client *client = v4l2_get_subdevdata(&imx911->sd);
-	u8 buf[6] = {0};
-
-	if (WARN_ON(len > 4))
-		return -EINVAL;
-
-	put_unaligned_be16(reg, buf);
-	put_unaligned_le32(val, buf + 2);
-	if (i2c_master_send(client, buf, len + 2) != len + 2)
-		return -EIO;
-
 	return 0;
 }
 
@@ -571,18 +632,9 @@ static int imx911_write_reg(struct imx911 *imx911, u16 reg, u32 len, u32 val)
  *
  * Return: 0 if successful, error code otherwise.
  */
-static int imx911_write_regs(struct imx911 *imx911,
+static int imx911_write_regs(struct tc358743_state *imx911,
 			     const struct imx911_reg *regs, u32 len)
 {
-	unsigned int i;
-	int ret;
-
-	for (i = 0; i < len; i++) {
-		ret = imx911_write_reg(imx911, regs[i].address, 1, regs[i].val);
-		if (ret)
-			return ret;
-	}
-
 	return 0;
 }
 
@@ -593,31 +645,31 @@ static int imx911_write_regs(struct imx911 *imx911,
  *
  * Return: 0 if successful, error code otherwise.
  */
-static int imx911_update_controls(struct imx911 *imx911,
+static int imx911_update_controls(struct tc358743_state *imx911,
 				  const struct imx911_mode *mode)
 {
 	int ret;
 
-	ret = __v4l2_ctrl_s_ctrl(imx911->link_freq_ctrl, mode->link_freq_idx);
+	ret = __v4l2_ctrl_s_ctrl(imx911->link_freq_ctrl_911, mode->link_freq_idx);
 	if (ret)
 		return ret;
 
-	ret = __v4l2_ctrl_modify_range(imx911->pclk_ctrl, mode->pclk,
+	ret = __v4l2_ctrl_modify_range(imx911->pclk_ctrl_911, mode->pclk,
 				       mode->pclk, 1, mode->pclk);
 	if (ret)
 		return ret;
 
-	ret = __v4l2_ctrl_modify_range(imx911->hblank_ctrl, mode->hblank,
+	ret = __v4l2_ctrl_modify_range(imx911->hblank_ctrl_911, mode->hblank,
 				       mode->hblank, 1, mode->hblank);
 	if (ret)
 		return ret;
 
-	ret =  __v4l2_ctrl_modify_range(imx911->vblank_ctrl, mode->vblank_min,
+	ret =  __v4l2_ctrl_modify_range(imx911->vblank_ctrl_911, mode->vblank_min,
 					mode->vblank_max, 1, mode->vblank);
 	if (ret)
 		return ret;
 
-	return __v4l2_ctrl_s_ctrl(imx911->vblank_ctrl, mode->vblank);
+	return __v4l2_ctrl_s_ctrl(imx911->vblank_ctrl_911, mode->vblank);
 }
 
 /**
@@ -628,33 +680,33 @@ static int imx911_update_controls(struct imx911 *imx911,
  *
  * Return: 0 if successful, error code otherwise.
  */
-static int imx911_update_exp_gain(struct imx911 *imx911, u32 exposure, u32 gain)
+static int imx911_update_exp_gain(struct tc358743_state *tc_state, u32 exposure, u32 gain)
 {
 	u32 lpfr, shutter;
 	int ret;
 
-	lpfr = imx911->vblank + imx911->cur_mode->height;
+	lpfr = tc_state->vblank_911 + tc_state->cur_mode_911->height;
 	shutter = lpfr - exposure;
 
-	dev_dbg(imx911->dev, "Set long exp %u analog gain %u sh0 %u lpfr %u",
+	dev_dbg(tc_state->dev_911, "Set long exp %u analog gain %u sh0 %u lpfr %u",
 		exposure, gain, shutter, lpfr);
 
-	ret = imx911_write_reg(imx911, IMX334_REG_HOLD, 1, 1);
+	ret = imx911_write_reg(tc_state, IMX334_REG_HOLD, 1, 1);
 	if (ret)
 		return ret;
 
-	ret = imx911_write_reg(imx911, IMX334_REG_LPFR, 3, lpfr);
+	ret = imx911_write_reg(tc_state, IMX334_REG_LPFR, 3, lpfr);
 	if (ret)
 		goto error_release_group_hold;
 
-	ret = imx911_write_reg(imx911, IMX334_REG_SHUTTER, 3, shutter);
+	ret = imx911_write_reg(tc_state, IMX334_REG_SHUTTER, 3, shutter);
 	if (ret)
 		goto error_release_group_hold;
 
-	ret = imx911_write_reg(imx911, IMX334_REG_AGAIN, 1, gain);
+	ret = imx911_write_reg(tc_state, IMX334_REG_AGAIN, 1, gain);
 
 error_release_group_hold:
-	imx911_write_reg(imx911, IMX334_REG_HOLD, 1, 0);
+	imx911_write_reg(tc_state, IMX334_REG_HOLD, 1, 0);
 
 	return ret;
 }
@@ -673,42 +725,36 @@ error_release_group_hold:
  */
 static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
 {
-	struct imx911 *imx911 =
-		container_of(ctrl->handler, struct imx911, ctrl_handler);
+	struct tc358743_state *imx911 =
+		container_of(ctrl->handler, struct tc358743_state, ctrl_handler_911);
 	u32 analog_gain;
 	u32 exposure;
 	int ret;
 
 	switch (ctrl->id) {
 	case V4L2_CID_VBLANK:
-		imx911->vblank = imx911->vblank_ctrl->val;
+		imx911->vblank_911 = imx911->vblank_ctrl_911->val;
 
-		dev_dbg(imx911->dev, "Received vblank %u, new lpfr %u",
-			imx911->vblank,
-			imx911->vblank + imx911->cur_mode->height);
+		dev_dbg(imx911->dev_911, "Received vblank %u, new lpfr %u",
+			imx911->vblank_911,
+			imx911->vblank_911 + imx911->cur_mode_911->height);
 
-		ret = __v4l2_ctrl_modify_range(imx911->exp_ctrl,
+		ret = __v4l2_ctrl_modify_range(imx911->exp_ctrl_911,
 					       IMX334_EXPOSURE_MIN,
-					       imx911->vblank +
-					       imx911->cur_mode->height -
+					       imx911->vblank_911 +
+					       imx911->cur_mode_911->height -
 					       IMX334_EXPOSURE_OFFSET,
 					       1, IMX334_EXPOSURE_DEFAULT);
 		break;
 	case V4L2_CID_EXPOSURE:
 
-		/* Set controls only if sensor is in power on state */
-		if (!pm_runtime_get_if_in_use(imx911->dev))
-			return 0;
-
 		exposure = ctrl->val;
-		analog_gain = imx911->again_ctrl->val;
+		analog_gain = imx911->again_ctrl_911->val;
 
-		dev_dbg(imx911->dev, "Received exp %u analog gain %u",
+		dev_dbg(imx911->dev_911, "Received exp %u analog gain %u",
 			exposure, analog_gain);
 
 		ret = imx911_update_exp_gain(imx911, exposure, analog_gain);
-
-		pm_runtime_put(imx911->dev);
 
 		break;
 	case V4L2_CID_PIXEL_RATE:
@@ -717,7 +763,7 @@ static int imx911_set_ctrl(struct v4l2_ctrl *ctrl)
 		ret = 0;
 		break;
 	default:
-		dev_err(imx911->dev, "Invalid control %d", ctrl->id);
+		dev_err(imx911->dev_911, "Invalid control %d", ctrl->id);
 		ret = -EINVAL;
 	}
 
@@ -729,7 +775,7 @@ static const struct v4l2_ctrl_ops imx911_ctrl_ops = {
 	.s_ctrl = imx911_set_ctrl,
 };
 
-static int imx911_get_format_code(struct imx911 *imx911, u32 code)
+static int imx911_get_format_code(struct tc358743_state *imx911, u32 code)
 {
 	unsigned int i;
 
@@ -773,7 +819,7 @@ static int imx911_enum_frame_size(struct v4l2_subdev *sd,
 				  struct v4l2_subdev_state *sd_state,
 				  struct v4l2_subdev_frame_size_enum *fsize)
 {
-	struct imx911 *imx911 = to_imx911(sd);
+	struct tc358743_state *imx911 = to_state(sd);
 	u32 code;
 
 	if (fsize->index >= ARRAY_SIZE(supported_modes))
@@ -799,7 +845,7 @@ static int imx911_enum_frame_size(struct v4l2_subdev *sd,
  * @mode: pointer to imx911_mode sensor mode
  * @fmt: V4L2 sub-device format need to be filled
  */
-static void imx911_fill_pad_format(struct imx911 *imx911,
+static void imx911_fill_pad_format(struct tc358743_state *imx911,
 				   const struct imx911_mode *mode,
 				   struct v4l2_subdev_format *fmt)
 {
@@ -824,7 +870,7 @@ static int imx911_get_pad_format(struct v4l2_subdev *sd,
 				 struct v4l2_subdev_state *sd_state,
 				 struct v4l2_subdev_format *fmt)
 {
-	struct imx911 *imx911 = to_imx911(sd);
+	struct tc358743_state *imx911 = to_state(sd);
 
 	mutex_lock(&imx911->mutex);
 
@@ -834,8 +880,8 @@ static int imx911_get_pad_format(struct v4l2_subdev *sd,
 		framefmt = v4l2_subdev_get_try_format(sd, sd_state, fmt->pad);
 		fmt->format = *framefmt;
 	} else {
-		fmt->format.code = imx911->cur_code;
-		imx911_fill_pad_format(imx911, imx911->cur_mode, fmt);
+		fmt->format.code = imx911->cur_code_911;
+		imx911_fill_pad_format(imx911, imx911->cur_mode_911, fmt);
 	}
 
 	mutex_unlock(&imx911->mutex);
@@ -855,7 +901,7 @@ static int imx911_set_pad_format(struct v4l2_subdev *sd,
 				 struct v4l2_subdev_state *sd_state,
 				 struct v4l2_subdev_format *fmt)
 {
-	struct imx911 *imx911 = to_imx911(sd);
+	struct tc358743_state *imx911 = to_state(sd);
 	const struct imx911_mode *mode;
 	int ret = 0;
 
@@ -874,11 +920,11 @@ static int imx911_set_pad_format(struct v4l2_subdev *sd,
 
 		framefmt = v4l2_subdev_get_try_format(sd, sd_state, fmt->pad);
 		*framefmt = fmt->format;
-	} else if (imx911->cur_mode != mode || imx911->cur_code != fmt->format.code) {
-		imx911->cur_code = fmt->format.code;
+	} else if (imx911->cur_mode_911 != mode || imx911->cur_code_911 != fmt->format.code) {
+		imx911->cur_code_911 = fmt->format.code;
 		ret = imx911_update_controls(imx911, mode);
 		if (!ret)
-			imx911->cur_mode = mode;
+			imx911->cur_mode_911 = mode;
 	}
 
 	mutex_unlock(&imx911->mutex);
@@ -896,28 +942,28 @@ static int imx911_set_pad_format(struct v4l2_subdev *sd,
 static int imx911_init_pad_cfg(struct v4l2_subdev *sd,
 			       struct v4l2_subdev_state *sd_state)
 {
-	struct imx911 *imx911 = to_imx911(sd);
+	struct tc358743_state *imx911 = to_state(sd);
 	struct v4l2_subdev_format fmt = { 0 };
 
 	fmt.which = sd_state ? V4L2_SUBDEV_FORMAT_TRY : V4L2_SUBDEV_FORMAT_ACTIVE;
 
 	mutex_lock(&imx911->mutex);
 
-	imx911_fill_pad_format(imx911, imx911->cur_mode, &fmt);
+	imx911_fill_pad_format(imx911, imx911->cur_mode_911, &fmt);
 
-	__v4l2_ctrl_modify_range(imx911->link_freq_ctrl, 0,
-				 __fls(imx911->menu_skip_mask),
-				 ~(imx911->menu_skip_mask),
-				 __ffs(imx911->menu_skip_mask));
+	__v4l2_ctrl_modify_range(imx911->link_freq_ctrl_911, 0,
+				 __fls(imx911->menu_skip_mask_911),
+				 ~(imx911->menu_skip_mask_911),
+				 __ffs(imx911->menu_skip_mask_911));
 
 	mutex_unlock(&imx911->mutex);
 
 	return imx911_set_pad_format(sd, sd_state, &fmt);
 }
 
-static int imx911_set_framefmt(struct imx911 *imx911)
+static int imx911_set_framefmt(struct tc358743_state *imx911)
 {
-	switch (imx911->cur_code) {
+	switch (imx911->cur_code_911) {
 	case MEDIA_BUS_FMT_SRGGB10_1X10:
 		return imx911_write_regs(imx911, raw10_framefmt_regs,
 					 ARRAY_SIZE(raw10_framefmt_regs));
@@ -936,23 +982,23 @@ static int imx911_set_framefmt(struct imx911 *imx911)
  *
  * Return: 0 if successful, error code otherwise.
  */
-static int imx911_start_streaming(struct imx911 *imx911)
+static int imx911_start_streaming(struct tc358743_state *imx911)
 {
 	const struct imx911_reg_list *reg_list;
 	int ret;
 
 	/* Write sensor mode registers */
-	reg_list = &imx911->cur_mode->reg_list;
+	reg_list = &imx911->cur_mode_911->reg_list;
 	ret = imx911_write_regs(imx911, reg_list->regs,
 				reg_list->num_of_regs);
 	if (ret) {
-		dev_err(imx911->dev, "fail to write initial registers");
+		dev_err(imx911->dev_911, "fail to write initial registers");
 		return ret;
 	}
 
 	ret = imx911_set_framefmt(imx911);
 	if (ret) {
-		dev_err(imx911->dev, "%s failed to set frame format: %d\n",
+		dev_err(imx911->dev_911, "%s failed to set frame format: %d\n",
 			__func__, ret);
 		return ret;
 	}
@@ -960,7 +1006,7 @@ static int imx911_start_streaming(struct imx911 *imx911)
 	/* Setup handler will write actual exposure and gain */
 	ret =  __v4l2_ctrl_handler_setup(imx911->sd.ctrl_handler);
 	if (ret) {
-		dev_err(imx911->dev, "fail to setup handler");
+		dev_err(imx911->dev_911, "fail to setup handler");
 		return ret;
 	}
 
@@ -968,7 +1014,7 @@ static int imx911_start_streaming(struct imx911 *imx911)
 	ret = imx911_write_reg(imx911, IMX334_REG_MODE_SELECT,
 			       1, IMX334_MODE_STREAMING);
 	if (ret) {
-		dev_err(imx911->dev, "fail to start streaming");
+		dev_err(imx911->dev_911, "fail to start streaming");
 		return ret;
 	}
 
@@ -981,7 +1027,7 @@ static int imx911_start_streaming(struct imx911 *imx911)
  *
  * Return: 0 if successful, error code otherwise.
  */
-static int imx911_stop_streaming(struct imx911 *imx911)
+static int imx911_stop_streaming(struct tc358743_state *imx911)
 {
 	return imx911_write_reg(imx911, IMX334_REG_MODE_SELECT,
 				1, IMX334_MODE_STANDBY);
@@ -996,37 +1042,28 @@ static int imx911_stop_streaming(struct imx911 *imx911)
  */
 static int imx911_set_stream(struct v4l2_subdev *sd, int enable)
 {
-	struct imx911 *imx911 = to_imx911(sd);
+	struct tc358743_state *imx911 = to_state(sd);
 	int ret;
 
 	mutex_lock(&imx911->mutex);
 
-	if (imx911->streaming == enable) {
+	if (imx911->streaming_911 == enable) {
 		mutex_unlock(&imx911->mutex);
 		return 0;
 	}
 
 	if (enable) {
-		ret = pm_runtime_resume_and_get(imx911->dev);
-		if (ret < 0)
-			goto error_unlock;
-
 		ret = imx911_start_streaming(imx911);
-		if (ret)
-			goto error_power_off;
 	} else {
 		imx911_stop_streaming(imx911);
-		pm_runtime_put(imx911->dev);
 	}
 
-	imx911->streaming = enable;
+	imx911->streaming_911 = enable;
 
 	mutex_unlock(&imx911->mutex);
 
 	return 0;
 
-error_power_off:
-	pm_runtime_put(imx911->dev);
 error_unlock:
 	mutex_unlock(&imx911->mutex);
 
@@ -1039,7 +1076,7 @@ error_unlock:
  *
  * Return: 0 if successful, -EIO if sensor id does not match
  */
-static int imx911_detect(struct imx911 *imx911)
+static int imx911_detect(struct tc358743_state *imx911)
 {
 	int ret;
 	u32 val;
@@ -1049,98 +1086,12 @@ static int imx911_detect(struct imx911 *imx911)
 		return ret;
 
 	if (val != IMX334_ID) {
-		dev_err(imx911->dev, "chip id mismatch: %x!=%x",
+		dev_err(imx911->dev_911, "chip id mismatch: %x!=%x",
 			IMX334_ID, val);
 		return -ENXIO;
 	}
 
 	return 0;
-}
-
-/**
- * imx911_parse_hw_config() - Parse HW configuration and check if supported
- * @imx911: pointer to imx911 device
- *
- * Return: 0 if successful, error code otherwise.
- */
-static int imx911_parse_hw_config(struct imx911 *imx911)
-{
-	struct fwnode_handle *fwnode = dev_fwnode(imx911->dev);
-	struct v4l2_fwnode_endpoint bus_cfg = {
-		.bus_type = V4L2_MBUS_CSI2_DPHY
-	};
-	struct fwnode_handle *ep;
-	unsigned long rate;
-	unsigned int i, j;
-	int ret;
-
-	if (!fwnode)
-		return -ENXIO;
-
-	/* Request optional reset pin */
-	imx911->reset_gpio = devm_gpiod_get_optional(imx911->dev, "reset",
-						     GPIOD_OUT_LOW);
-	if (IS_ERR(imx911->reset_gpio)) {
-		dev_err(imx911->dev, "failed to get reset gpio %ld",
-			PTR_ERR(imx911->reset_gpio));
-		return PTR_ERR(imx911->reset_gpio);
-	}
-
-	/* Get sensor input clock */
-	imx911->inclk = devm_clk_get(imx911->dev, NULL);
-	if (IS_ERR(imx911->inclk)) {
-		dev_err(imx911->dev, "could not get inclk");
-		return PTR_ERR(imx911->inclk);
-	}
-
-	rate = clk_get_rate(imx911->inclk);
-	if (rate != IMX334_INCLK_RATE) {
-		dev_err(imx911->dev, "inclk frequency mismatch");
-		return -EINVAL;
-	}
-
-	ep = fwnode_graph_get_next_endpoint(fwnode, NULL);
-	if (!ep)
-		return -ENXIO;
-
-	ret = v4l2_fwnode_endpoint_alloc_parse(ep, &bus_cfg);
-	fwnode_handle_put(ep);
-	if (ret)
-		return ret;
-
-	if (bus_cfg.bus.mipi_csi2.num_data_lanes != IMX334_NUM_DATA_LANES) {
-		dev_err(imx911->dev,
-			"number of CSI2 data lanes %d is not supported",
-			bus_cfg.bus.mipi_csi2.num_data_lanes);
-		ret = -EINVAL;
-		goto done_endpoint_free;
-	}
-
-	if (!bus_cfg.nr_of_link_frequencies) {
-		dev_err(imx911->dev, "no link frequencies defined");
-		ret = -EINVAL;
-		goto done_endpoint_free;
-	}
-
-	for (i = 0; i < bus_cfg.nr_of_link_frequencies; i++) {
-		for (j = 0; j < ARRAY_SIZE(link_freq); j++) {
-			if (bus_cfg.link_frequencies[i] == link_freq[j]) {
-				set_bit(j, &imx911->menu_skip_mask);
-				break;
-			}
-		}
-
-		if (j == ARRAY_SIZE(link_freq)) {
-			ret = dev_err_probe(imx911->dev, -EINVAL,
-					    "no supported link freq found\n");
-			goto done_endpoint_free;
-		}
-	}
-
-done_endpoint_free:
-	v4l2_fwnode_endpoint_free(&bus_cfg);
-
-	return ret;
 }
 
 /* V4l2 subdevice ops */
@@ -1167,10 +1118,10 @@ static const struct v4l2_subdev_ops imx911_subdev_ops = {
  *
  * Return: 0 if successful, error code otherwise.
  */
-static int imx911_init_controls(struct imx911 *imx911)
+static int imx911_init_controls(struct tc358743_state *imx911)
 {
-	struct v4l2_ctrl_handler *ctrl_hdlr = &imx911->ctrl_handler;
-	const struct imx911_mode *mode = imx911->cur_mode;
+	struct v4l2_ctrl_handler *ctrl_hdlr = &imx911->ctrl_handler_911;
+	const struct imx911_mode *mode = imx911->cur_mode_911;
 	u32 lpfr;
 	int ret;
 
@@ -1183,7 +1134,7 @@ static int imx911_init_controls(struct imx911 *imx911)
 
 	/* Initialize exposure and gain */
 	lpfr = mode->vblank + mode->height;
-	imx911->exp_ctrl = v4l2_ctrl_new_std(ctrl_hdlr,
+	imx911->exp_ctrl_911 = v4l2_ctrl_new_std(ctrl_hdlr,
 					     &imx911_ctrl_ops,
 					     V4L2_CID_EXPOSURE,
 					     IMX334_EXPOSURE_MIN,
@@ -1191,7 +1142,7 @@ static int imx911_init_controls(struct imx911 *imx911)
 					     IMX334_EXPOSURE_STEP,
 					     IMX334_EXPOSURE_DEFAULT);
 
-	imx911->again_ctrl = v4l2_ctrl_new_std(ctrl_hdlr,
+	imx911->again_ctrl_911 = v4l2_ctrl_new_std(ctrl_hdlr,
 					       &imx911_ctrl_ops,
 					       V4L2_CID_ANALOGUE_GAIN,
 					       IMX334_AGAIN_MIN,
@@ -1199,9 +1150,9 @@ static int imx911_init_controls(struct imx911 *imx911)
 					       IMX334_AGAIN_STEP,
 					       IMX334_AGAIN_DEFAULT);
 
-	v4l2_ctrl_cluster(2, &imx911->exp_ctrl);
+	v4l2_ctrl_cluster(2, &imx911->exp_ctrl_911);
 
-	imx911->vblank_ctrl = v4l2_ctrl_new_std(ctrl_hdlr,
+	imx911->vblank_ctrl_911 = v4l2_ctrl_new_std(ctrl_hdlr,
 						&imx911_ctrl_ops,
 						V4L2_CID_VBLANK,
 						mode->vblank_min,
@@ -1209,33 +1160,33 @@ static int imx911_init_controls(struct imx911 *imx911)
 						1, mode->vblank);
 
 	/* Read only controls */
-	imx911->pclk_ctrl = v4l2_ctrl_new_std(ctrl_hdlr,
+	imx911->pclk_ctrl_911 = v4l2_ctrl_new_std(ctrl_hdlr,
 					      &imx911_ctrl_ops,
 					      V4L2_CID_PIXEL_RATE,
 					      mode->pclk, mode->pclk,
 					      1, mode->pclk);
 
-	imx911->link_freq_ctrl = v4l2_ctrl_new_int_menu(ctrl_hdlr,
+	imx911->link_freq_ctrl_911 = v4l2_ctrl_new_int_menu(ctrl_hdlr,
 							&imx911_ctrl_ops,
 							V4L2_CID_LINK_FREQ,
-							__fls(imx911->menu_skip_mask),
-							__ffs(imx911->menu_skip_mask),
+							__fls(imx911->menu_skip_mask_911),
+							__ffs(imx911->menu_skip_mask_911),
 							link_freq);
 
-	if (imx911->link_freq_ctrl)
-		imx911->link_freq_ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	if (imx911->link_freq_ctrl_911)
+		imx911->link_freq_ctrl_911->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
-	imx911->hblank_ctrl = v4l2_ctrl_new_std(ctrl_hdlr,
+	imx911->hblank_ctrl_911 = v4l2_ctrl_new_std(ctrl_hdlr,
 						&imx911_ctrl_ops,
 						V4L2_CID_HBLANK,
 						IMX334_REG_MIN,
 						IMX334_REG_MAX,
 						1, mode->hblank);
-	if (imx911->hblank_ctrl)
-		imx911->hblank_ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	if (imx911->hblank_ctrl_911)
+		imx911->hblank_ctrl_911->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
 	if (ctrl_hdlr->error) {
-		dev_err(imx911->dev, "control init failed: %d",
+		dev_err(imx911->dev_911, "control init failed: %d",
 			ctrl_hdlr->error);
 		v4l2_ctrl_handler_free(ctrl_hdlr);
 		return ctrl_hdlr->error;
@@ -1252,64 +1203,50 @@ static int imx911_init_controls(struct imx911 *imx911)
  *
  * Return: 0 if successful, error code otherwise.
  */
-static int imx911_probe(struct i2c_client *client)
+static int imx911_probe(struct i2c_client *client, struct tc358743_state *state)
+//static int imx911_probe(struct i2c_client *client, struct imx911 *state)
 {
-	struct imx911 *imx911;
 	int ret;
 
-	imx911 = devm_kzalloc(&client->dev, sizeof(*imx911), GFP_KERNEL);
-	if (!imx911)
-		return -ENOMEM;
-
-	imx911->dev = &client->dev;
-
 	/* Initialize subdev */
-	v4l2_i2c_subdev_init(&imx911->sd, client, &imx911_subdev_ops);
-
-	ret = imx911_parse_hw_config(imx911);
-	if (ret) {
-		dev_err(imx911->dev, "HW configuration is not supported");
-		return ret;
-	}
-
-	mutex_init(&imx911->mutex);
+	v4l2_i2c_subdev_init(&state->sd, client, &imx911_subdev_ops);
 
 	/* Set default mode to max resolution */
-	imx911->cur_mode = &supported_modes[__ffs(imx911->menu_skip_mask)];
-	imx911->cur_code = imx911_mbus_codes[0];
-	imx911->vblank = imx911->cur_mode->vblank;
+	state->cur_mode_911 = &supported_modes[__ffs(state->menu_skip_mask_911)];
+	state->cur_code_911 = imx911_mbus_codes[0];
+	state->vblank_911 = state->cur_mode_911->vblank;
 
+#if 0
+    // done in tc3 probe.
 	/* Initialize subdev */
-	imx911->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
-	imx911->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
+	state->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
+	state->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
 
 	/* Initialize source pad */
-	imx911->pad.flags = MEDIA_PAD_FL_SOURCE;
-	ret = media_entity_pads_init(&imx911->sd.entity, 1, &imx911->pad);
+	state->pad.flags = MEDIA_PAD_FL_SOURCE;
+
+	ret = media_entity_pads_init(&state->sd.entity, 1, &state->pad);
 	if (ret) {
-		dev_err(imx911->dev, "failed to init entity pads: %d", ret);
+		dev_err(state->dev, "failed to init entity pads: %d", ret);
 		goto error_handler_free;
 	}
+#endif
 
-	ret = v4l2_async_register_subdev_sensor(&imx911->sd);
+	ret = v4l2_async_register_subdev_sensor(&state->sd);
 	if (ret < 0) {
-		dev_err(imx911->dev,
+		dev_err(state->dev_911,
 			"failed to register async subdev: %d", ret);
 		goto error_media_entity;
 	}
 
-	pm_runtime_set_active(imx911->dev);
-	pm_runtime_enable(imx911->dev);
-	pm_runtime_idle(imx911->dev);
-
 	return 0;
 
 error_media_entity:
-	media_entity_cleanup(&imx911->sd.entity);
+	media_entity_cleanup(&state->sd.entity);
 error_handler_free:
-	v4l2_ctrl_handler_free(imx911->sd.ctrl_handler);
+	v4l2_ctrl_handler_free(state->sd.ctrl_handler);
 error_mutex_destroy:
-	mutex_destroy(&imx911->mutex);
+	mutex_destroy(&state->mutex);
 
 	return ret;
 }
@@ -1352,7 +1289,8 @@ error_mutex_destroy:
 
 #include "tc358743_regs.h"
 
-static int debug;
+static int debug = 0x3;
+
 module_param(debug, int, 0644);
 MODULE_PARM_DESC(debug, "debug level (0-3)");
 
@@ -1383,46 +1321,9 @@ static const struct v4l2_dv_timings_cap tc358743_timings_cap = {
 			V4L2_DV_BT_CAP_CUSTOM)
 };
 
-struct tc358743_state {
-	struct tc358743_platform_data pdata;
-	struct v4l2_mbus_config_mipi_csi2 bus;
-	struct v4l2_subdev sd;
-	struct media_pad pad;
-	struct v4l2_ctrl_handler hdl;
-	struct i2c_client *i2c_client;
-	/* CONFCTL is modified in ops and tc358743_hdmi_sys_int_handler */
-	struct mutex confctl_mutex;
-
-	/* controls */
-	struct v4l2_ctrl *detect_tx_5v_ctrl;
-	struct v4l2_ctrl *audio_sampling_rate_ctrl;
-	struct v4l2_ctrl *audio_present_ctrl;
-
-	struct delayed_work delayed_work_enable_hotplug;
-
-	struct timer_list timer;
-	struct work_struct work_i2c_poll;
-
-	/* edid  */
-	u8 edid_blocks_written;
-
-	struct v4l2_dv_timings timings;
-	u32 mbus_fmt_code;
-	u8 csi_lanes_in_use;
-
-	struct gpio_desc *reset_gpio;
-
-	struct cec_adapter *cec_adap;
-};
-
 static void tc358743_enable_interrupts(struct v4l2_subdev *sd,
 		bool cable_connected);
 static int tc358743_s_ctrl_detect_tx_5v(struct v4l2_subdev *sd);
-
-static inline struct tc358743_state *to_state(struct v4l2_subdev *sd)
-{
-	return container_of(sd, struct tc358743_state, sd);
-}
 
 /* --------------- I2C --------------- */
 
@@ -1487,7 +1388,7 @@ static void i2c_wr(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
 		return;
 	}
 
-	if (debug < 3)
+	if (debug < 4)
 		return;
 
 	switch (n) {
@@ -1868,10 +1769,10 @@ static inline void enable_stream(struct v4l2_subdev *sd, bool enable)
 		i2c_wr8(sd, VI_MUTE, MASK_AUTO_MUTE | MASK_VI_MUTE);
 	}
 
-	mutex_lock(&state->confctl_mutex);
+	mutex_lock(&state->mutex);
 	i2c_wr16_and_or(sd, CONFCTL, ~(MASK_VBUFEN | MASK_ABUFEN),
 			enable ? (MASK_VBUFEN | MASK_ABUFEN) : 0x0);
-	mutex_unlock(&state->confctl_mutex);
+	mutex_unlock(&state->mutex);
 }
 
 static void tc358743_set_pll(struct v4l2_subdev *sd)
@@ -1974,10 +1875,10 @@ static void tc358743_set_csi_color_space(struct v4l2_subdev *sd)
 				MASK_SEL422 | MASK_VOUT_422FIL_100);
 		i2c_wr8_and_or(sd, VI_REP, ~MASK_VOUT_COLOR_SEL & 0xff,
 				MASK_VOUT_COLOR_601_YCBCR_LIMITED);
-		mutex_lock(&state->confctl_mutex);
+		mutex_lock(&state->mutex);
 		i2c_wr16_and_or(sd, CONFCTL, ~MASK_YCBCRFMT,
 				MASK_YCBCRFMT_422_8_BIT);
-		mutex_unlock(&state->confctl_mutex);
+		mutex_unlock(&state->mutex);
 		break;
 	case MEDIA_BUS_FMT_RGB888_1X24:
 		v4l2_dbg(2, debug, sd, "%s: RGB 888 24-bit\n", __func__);
@@ -1986,9 +1887,9 @@ static void tc358743_set_csi_color_space(struct v4l2_subdev *sd)
 				0x00);
 		i2c_wr8_and_or(sd, VI_REP, ~MASK_VOUT_COLOR_SEL & 0xff,
 				MASK_VOUT_COLOR_RGB_FULL);
-		mutex_lock(&state->confctl_mutex);
+		mutex_lock(&state->mutex);
 		i2c_wr16_and_or(sd, CONFCTL, ~MASK_YCBCRFMT, 0);
-		mutex_unlock(&state->confctl_mutex);
+		mutex_unlock(&state->mutex);
 		break;
 	default:
 		v4l2_dbg(2, debug, sd, "%s: Unsupported format code 0x%x\n",
@@ -2123,10 +2024,10 @@ static void tc358743_set_hdmi_audio(struct v4l2_subdev *sd)
 	i2c_wr8(sd, SDO_MODE1, MASK_SDO_FMT_I2S);
 	i2c_wr8(sd, DIV_MODE, SET_DIV_DLY_MS(100));
 
-	mutex_lock(&state->confctl_mutex);
+	mutex_lock(&state->mutex);
 	i2c_wr16_and_or(sd, CONFCTL, 0xffff, MASK_AUDCHNUM_2 |
 			MASK_AUDOUTSEL_I2S | MASK_AUTOINDEX);
-	mutex_unlock(&state->confctl_mutex);
+	mutex_unlock(&state->mutex);
 }
 
 static void tc358743_set_hdmi_info_frame_mode(struct v4l2_subdev *sd)
@@ -2746,7 +2647,7 @@ static int tc358743_isr(struct v4l2_subdev *sd, u32 status, bool *handled)
 {
 	u16 intstatus = i2c_rd16(sd, INTSTATUS);
 
-	v4l2_dbg(1, debug, sd, "%s: IntStatus = 0x%04x\n", __func__, intstatus);
+	//v4l2_dbg(1, debug, sd, "%s: IntStatus = 0x%04x\n", __func__, intstatus);
 
 	if (intstatus & MASK_HDMI_INT) {
 		u8 hdmi_int0 = i2c_rd8(sd, HDMI_INT0);
@@ -3360,15 +3261,19 @@ static int tc358743_probe(struct i2c_client *client)
 {
 	static struct v4l2_dv_timings default_timing =
 		V4L2_DV_BT_CEA_640X480P59_94;
+
 	struct tc358743_state *state;
+
 	struct tc358743_platform_data *pdata = client->dev.platform_data;
 	struct v4l2_subdev *sd;
+
 	u16 irq_mask = MASK_HDMI_MSK | MASK_CSI_MSK;
 	u16 chipid;
 	int err;
 
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_BYTE_DATA))
 		return -EIO;
+
 	v4l_dbg(1, debug, client, "chip found @ 0x%x (%s)\n",
 		client->addr << 1, client->adapter->name);
 
@@ -3378,6 +3283,7 @@ static int tc358743_probe(struct i2c_client *client)
 		return -ENOMEM;
 
 	state->i2c_client = client;
+    state->dev_911 = &client->dev;
 
 	/* platform data */
 	if (pdata) {
@@ -3437,7 +3343,7 @@ static int tc358743_probe(struct i2c_client *client)
 
 	sd->dev = &client->dev;
 
-	mutex_init(&state->confctl_mutex);
+	mutex_init(&state->mutex);
 
 	INIT_DELAYED_WORK(&state->delayed_work_enable_hotplug,
 			tc358743_delayed_work_enable_hotplug);
@@ -3507,7 +3413,7 @@ err_work_queues:
 	if (!state->i2c_client->irq)
 		flush_work(&state->work_i2c_poll);
 	cancel_delayed_work(&state->delayed_work_enable_hotplug);
-	mutex_destroy(&state->confctl_mutex);
+	mutex_destroy(&state->mutex);
 err_hdl:
 	media_entity_cleanup(&sd->entity);
 	v4l2_ctrl_handler_free(&state->hdl);
@@ -3527,7 +3433,7 @@ static void tc358743_remove(struct i2c_client *client)
 	cec_unregister_adapter(state->cec_adap);
 	v4l2_async_unregister_subdev(sd);
 	v4l2_device_unregister_subdev(sd);
-	mutex_destroy(&state->confctl_mutex);
+	mutex_destroy(&state->mutex);
 	media_entity_cleanup(&sd->entity);
 	v4l2_ctrl_handler_free(&state->hdl);
 }
