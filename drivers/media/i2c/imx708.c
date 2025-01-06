@@ -554,14 +554,7 @@ static int imx708_set_exposure(struct imx708 *imx708, unsigned int val)
 {
 	val = max(val, imx708->mode->exposure_lines_min);
 	val -= val % imx708->mode->exposure_lines_step;
-
-	/*
-	 * In HDR mode this will set the longest exposure. The sensor
-	 * will automatically divide the medium and short ones by 4,16.
-	 */
-	return imx708_write_reg(imx708, IMX708_REG_EXPOSURE,
-				IMX708_REG_VALUE_16BIT,
-				val >> imx708->long_exp_shift);
+    return 0;
 }
 
 static void imx708_adjust_exposure_range(struct imx708 *imx708,
@@ -580,36 +573,12 @@ static void imx708_adjust_exposure_range(struct imx708 *imx708,
 
 static int imx708_set_analogue_gain(struct imx708 *imx708, unsigned int val)
 {
-	int ret;
-
-	/*
-	 * In HDR mode this will set the gain for the longest exposure,
-	 * and by default the sensor uses the same gain for all of them.
-	 */
-	ret = imx708_write_reg(imx708, IMX708_REG_ANALOG_GAIN,
-			       IMX708_REG_VALUE_16BIT, val);
-
-	return ret;
+	return 0;
 }
 
 static int imx708_set_frame_length(struct imx708 *imx708, unsigned int val)
 {
-	int ret;
-
-	imx708->long_exp_shift = 0;
-
-	while (val > IMX708_FRAME_LENGTH_MAX) {
-		imx708->long_exp_shift++;
-		val >>= 1;
-	}
-
-	ret = imx708_write_reg(imx708, IMX708_REG_FRAME_LENGTH,
-			       IMX708_REG_VALUE_16BIT, val);
-	if (ret)
-		return ret;
-
-	return imx708_write_reg(imx708, IMX708_LONG_EXP_SHIFT_REG,
-				IMX708_REG_VALUE_08BIT, imx708->long_exp_shift);
+    return 0;
 }
 
 static void imx708_set_framing_limits(struct imx708 *imx708)
@@ -688,14 +657,17 @@ static int imx708_set_ctrl(struct v4l2_ctrl *ctrl)
 		ret = imx708_set_exposure(imx708, ctrl->val);
 		break;
 	case V4L2_CID_DIGITAL_GAIN:
-		ret = imx708_write_reg(imx708, IMX708_REG_DIGITAL_GAIN,
-				       IMX708_REG_VALUE_16BIT, ctrl->val);
+		dev_info(&client->dev,
+			 "ctrl V4L2_CID_DIGITAL_GAIN (id:0x%x,val:0x%x) is not handled\n",
+			 ctrl->id, ctrl->val);
+		ret = 0;
 		break;
 	case V4L2_CID_TEST_PATTERN:
         
 		dev_info(&client->dev,
 			 "ctrl V4L2_CID_TEST_PATTERN (id:0x%x,val:0x%x) is not handled\n",
 			 ctrl->id, ctrl->val);
+        ret = 0;
 		break;
 	case V4L2_CID_TEST_PATTERN_RED:
 		ret = imx708_write_reg(imx708, IMX708_REG_TEST_PATTERN_R,
@@ -1182,18 +1154,7 @@ static int imx708_get_regulators(struct imx708 *imx708)
 /* Verify chip ID */
 static int imx708_identify_module(struct imx708 *imx708)
 {
-	struct i2c_client *client = v4l2_get_subdevdata(&imx708->sd);
-	int ret;
-	u32 val;
-
-	ret = imx708_read_reg(imx708, 0x0000, IMX708_REG_VALUE_16BIT, &val);
-	if (!ret) {
-		dev_info(&client->dev, "camera module ID 0x%04x\n", val);
-		snprintf(imx708->sd.name, sizeof(imx708->sd.name), "imx708%s%s",
-			 val & 0x02 ? "_wide" : "",
-			 val & 0x80 ? "_noir" : "");
-	}
-
+	//struct i2c_client *client = v4l2_get_subdevdata(&imx708->sd);
 	return 0;
 }
 
