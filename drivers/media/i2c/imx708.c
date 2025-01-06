@@ -405,46 +405,6 @@ static inline void get_mode_table(unsigned int code,
 	}
 }
 
-/* Write registers up to 2 at a time */
-static int imx708_write_reg(struct imx708 *imx708, u16 reg, u32 len, u32 val)
-{
-	struct i2c_client *client = v4l2_get_subdevdata(&imx708->sd);
-	u8 buf[6];
-
-	if (len > 4)
-		return -EINVAL;
-
-	put_unaligned_be16(reg, buf);
-	put_unaligned_be32(val << (8 * (4 - len)), buf + 2);
-	if (i2c_master_send(client, buf, len + 2) != len + 2)
-		return -EIO;
-
-	return 0;
-}
-
-/* Write a list of registers */
-static int imx708_write_regs(struct imx708 *imx708,
-			     const struct imx708_reg *regs, u32 len)
-{
-	struct i2c_client *client = v4l2_get_subdevdata(&imx708->sd);
-	unsigned int i;
-
-	for (i = 0; i < len; i++) {
-		int ret;
-
-		ret = imx708_write_reg(imx708, regs[i].address, 1, regs[i].val);
-		if (ret) {
-			dev_err_ratelimited(&client->dev,
-					    "Failed to write reg 0x%4.4x. error = %d\n",
-					    regs[i].address, ret);
-
-			return ret;
-		}
-	}
-
-	return 0;
-}
-
 /* Get bayer order based on flip setting. */
 static u32 imx708_get_format_code(struct imx708 *imx708)
 {
@@ -924,50 +884,16 @@ static int imx708_start_streaming(struct imx708 *imx708)
 	const struct imx708_reg_list *reg_list;
 	int ret;
 
-	/* Apply default values of current mode */
-	reg_list = &imx708->mode->reg_list;
-	ret = imx708_write_regs(imx708, reg_list->regs, reg_list->num_of_regs);
-	if (ret) {
-		dev_err(&client->dev, "%s failed to set mode\n", __func__);
-		return ret;
-	}
-
-	/* Quad Bayer re-mosaic adjustments (for full-resolution mode only) */
-	if (imx708->mode->remosaic && qbc_adjust > 0) {
-		imx708_write_reg(imx708, IMX708_LPF_INTENSITY,
-				 IMX708_REG_VALUE_08BIT, qbc_adjust);
-		imx708_write_reg(imx708,
-				 IMX708_LPF_INTENSITY_EN,
-				 IMX708_REG_VALUE_08BIT,
-				 IMX708_LPF_INTENSITY_ENABLED);
-	} else {
-		imx708_write_reg(imx708,
-				 IMX708_LPF_INTENSITY_EN,
-				 IMX708_REG_VALUE_08BIT,
-				 IMX708_LPF_INTENSITY_DISABLED);
-	}
-
 	/* Apply customized values from user */
 	ret =  __v4l2_ctrl_handler_setup(imx708->sd.ctrl_handler);
-	if (ret)
-		return ret;
-
-	/* set stream on register */
-	return imx708_write_reg(imx708, IMX708_REG_MODE_SELECT,
-				IMX708_REG_VALUE_08BIT, IMX708_MODE_STREAMING);
+    return ret;
 }
 
 /* Stop streaming */
 static void imx708_stop_streaming(struct imx708 *imx708)
 {
 	struct i2c_client *client = v4l2_get_subdevdata(&imx708->sd);
-	int ret;
-
-	/* set stream off register */
-	ret = imx708_write_reg(imx708, IMX708_REG_MODE_SELECT,
-			       IMX708_REG_VALUE_08BIT, IMX708_MODE_STANDBY);
-	if (ret)
-		dev_err(&client->dev, "%s failed to set stream\n", __func__);
+    dev_err(&client->dev, "%s failed to set stream\n", __func__);
 }
 
 static int imx708_set_stream(struct v4l2_subdev *sd, int enable)
