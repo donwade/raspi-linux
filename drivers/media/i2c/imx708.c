@@ -405,39 +405,6 @@ static inline void get_mode_table(unsigned int code,
 	}
 }
 
-/* Read registers up to 2 at a time */
-static int imx708_read_reg(struct imx708 *imx708, u16 reg, u32 len, u32 *val)
-{
-	struct i2c_client *client = v4l2_get_subdevdata(&imx708->sd);
-	struct i2c_msg msgs[2];
-	u8 addr_buf[2] = { reg >> 8, reg & 0xff };
-	u8 data_buf[4] = { 0, };
-	int ret;
-
-	if (len > 4)
-		return -EINVAL;
-
-	/* Write register address */
-	msgs[0].addr = client->addr;
-	msgs[0].flags = 0;
-	msgs[0].len = ARRAY_SIZE(addr_buf);
-	msgs[0].buf = addr_buf;
-
-	/* Read data from register */
-	msgs[1].addr = client->addr;
-	msgs[1].flags = I2C_M_RD;
-	msgs[1].len = len;
-	msgs[1].buf = &data_buf[4 - len];
-
-	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
-	if (ret != ARRAY_SIZE(msgs))
-		return -EIO;
-
-	*val = get_unaligned_be32(data_buf);
-
-	return 0;
-}
-
 /* Write registers up to 2 at a time */
 static int imx708_write_reg(struct imx708 *imx708, u16 reg, u32 len, u32 val)
 {
@@ -646,67 +613,63 @@ static int imx708_set_ctrl(struct v4l2_ctrl *ctrl)
 	 * Applying V4L2 control value only happens
 	 * when power is up for streaming
 	 */
-	if (pm_runtime_get_if_in_use(&client->dev) == 0)
-		return 0;
-
+    ret = 0;
 	switch (ctrl->id) {
 	case V4L2_CID_ANALOGUE_GAIN:
-		imx708_set_analogue_gain(imx708, ctrl->val);
-		break;
+		dev_info(&client->dev,
+			 "ctrl V4L2_CID_DIGITAL_GAIN (id:0x%x,val:0x%x) is not handled\n",
+			 ctrl->id, ctrl->val);
+        break;
 	case V4L2_CID_EXPOSURE:
-		ret = imx708_set_exposure(imx708, ctrl->val);
+		dev_info(&client->dev,
+			 "ctrl V4L2_CID_DIGITAL_GAIN (id:0x%x,val:0x%x) is not handled\n",
+			 ctrl->id, ctrl->val);
 		break;
 	case V4L2_CID_DIGITAL_GAIN:
 		dev_info(&client->dev,
 			 "ctrl V4L2_CID_DIGITAL_GAIN (id:0x%x,val:0x%x) is not handled\n",
 			 ctrl->id, ctrl->val);
-		ret = 0;
 		break;
 	case V4L2_CID_TEST_PATTERN:
-        
 		dev_info(&client->dev,
 			 "ctrl V4L2_CID_TEST_PATTERN (id:0x%x,val:0x%x) is not handled\n",
 			 ctrl->id, ctrl->val);
-        ret = 0;
 		break;
 	case V4L2_CID_TEST_PATTERN_RED:
-		ret = imx708_write_reg(imx708, IMX708_REG_TEST_PATTERN_R,
-				       IMX708_REG_VALUE_16BIT, ctrl->val);
-		break;
-	case V4L2_CID_TEST_PATTERN_GREENR:
-		ret = imx708_write_reg(imx708, IMX708_REG_TEST_PATTERN_GR,
-				       IMX708_REG_VALUE_16BIT, ctrl->val);
+		dev_info(&client->dev,
+			 "ctrl V4L2_CID_TEST_PATTERN_RED (id:0x%x,val:0x%x) is not handled\n",
+			 ctrl->id, ctrl->val);
 		break;
 	case V4L2_CID_TEST_PATTERN_BLUE:
-		ret = imx708_write_reg(imx708, IMX708_REG_TEST_PATTERN_B,
-				       IMX708_REG_VALUE_16BIT, ctrl->val);
+		dev_info(&client->dev,
+			 "ctrl V4L2_CID_TEST_PATTERN_BLUE (id:0x%x,val:0x%x) is not handled\n",
+			 ctrl->id, ctrl->val);
 		break;
 	case V4L2_CID_TEST_PATTERN_GREENB:
-		ret = imx708_write_reg(imx708, IMX708_REG_TEST_PATTERN_GB,
-				       IMX708_REG_VALUE_16BIT, ctrl->val);
+		dev_info(&client->dev,
+			 "ctrl V4L2_CID_TEST_PATTERN_GREENB (id:0x%x,val:0x%x) is not handled\n",
+			 ctrl->id, ctrl->val);
 		break;
 	case V4L2_CID_HFLIP:
 	case V4L2_CID_VFLIP:
-		ret = imx708_write_reg(imx708, IMX708_REG_ORIENTATION, 1,
-				       imx708->hflip->val |
-				       imx708->vflip->val << 1);
+		dev_info(&client->dev,
+			 "ctrl V4L2_CID_H/VFLIP (id:0x%x,val:0x%x) is not handled\n",
+			 ctrl->id, ctrl->val);
 		break;
 	case V4L2_CID_VBLANK:
-		ret = imx708_set_frame_length(imx708,
-					      imx708->mode->height + ctrl->val);
+		dev_info(&client->dev,
+			 "ctrl V4L2_CID_VBLANK (id:0x%x,val:0x%x) is not handled\n",
+			 ctrl->id, ctrl->val);
 		break;
 	case V4L2_CID_NOTIFY_GAINS:
-		ret = imx708_write_reg(imx708, IMX708_REG_COLOUR_BALANCE_BLUE,
-				       IMX708_REG_VALUE_16BIT,
-				       ctrl->p_new.p_u32[0]);
-		if (ret)
-			break;
-		ret = imx708_write_reg(imx708, IMX708_REG_COLOUR_BALANCE_RED,
-				       IMX708_REG_VALUE_16BIT,
-				       ctrl->p_new.p_u32[3]);
+		dev_info(&client->dev,
+			 "ctrl V4L2_CID_NOTIFY_GAINS (id:0x%x,val:0x%x) is not handled\n",
+			 ctrl->id, ctrl->val);
 		break;
 	case V4L2_CID_WIDE_DYNAMIC_RANGE:
-		/* Already handled above. */
+		dev_info(&client->dev,
+			 "ctrl V4L2_CID_WIDE_DYNAMIC_RANGE (id:0x%x,val:0x%x) is not handled\n",
+			 ctrl->id, ctrl->val);
 		break;
 	default:
 		dev_info(&client->dev,
@@ -960,21 +923,6 @@ static int imx708_start_streaming(struct imx708 *imx708)
 	struct i2c_client *client = v4l2_get_subdevdata(&imx708->sd);
 	const struct imx708_reg_list *reg_list;
 	int ret;
-	u32 val;
-
-	if (!imx708->common_regs_written) {
-		ret = imx708_read_reg(imx708, IMX708_REG_BASE_SPC_GAINS_L,
-				      IMX708_REG_VALUE_08BIT, &val);
-		if (ret == 0 && val == 0x40) {
-		}
-		if (ret) {
-			dev_err(&client->dev, "%s failed to set PDAF gains\n",
-				__func__);
-			return ret;
-		}
-
-		imx708->common_regs_written = true;
-	}
 
 	/* Apply default values of current mode */
 	reg_list = &imx708->mode->reg_list;
