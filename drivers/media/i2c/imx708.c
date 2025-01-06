@@ -31,10 +31,6 @@ MODULE_PARM_DESC(qbc_adjust, "Quad Bayer broken line correction strength [0,2-5]
 #define IMX708_REG_VALUE_08BIT		1
 #define IMX708_REG_VALUE_16BIT		2
 
-/* Chip ID */
-#define IMX708_REG_CHIP_ID		0x0016
-#define IMX708_CHIP_ID			0x0708
-
 #define IMX708_REG_MODE_SELECT		0x0100
 #define IMX708_MODE_STANDBY		0x00
 #define IMX708_MODE_STREAMING		0x01
@@ -1189,20 +1185,6 @@ static int imx708_identify_module(struct imx708 *imx708)
 	struct i2c_client *client = v4l2_get_subdevdata(&imx708->sd);
 	int ret;
 	u32 val;
-
-	ret = imx708_read_reg(imx708, IMX708_REG_CHIP_ID,
-			      IMX708_REG_VALUE_16BIT, &val);
-	if (ret) {
-		dev_err(&client->dev, "failed to read chip id %x, with error %d\n",
-			IMX708_CHIP_ID, ret);
-		return ret;
-	}
-
-	if (val != IMX708_CHIP_ID) {
-		dev_err(&client->dev, "chip id mismatch: %x!=%x\n",
-			IMX708_CHIP_ID, val);
-		return -EIO;
-	}
 
 	ret = imx708_read_reg(imx708, 0x0000, IMX708_REG_VALUE_16BIT, &val);
 	if (!ret) {
