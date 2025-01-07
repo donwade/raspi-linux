@@ -127,9 +127,6 @@ struct imx708_mode {
 	/* Default framerate. */
 	unsigned int vblank_default;
 
-	/* Default register values */
-	struct imx708_reg_list reg_list;
-
 	/* Not all modes have the same pixel rate. */
 	u64 pixel_rate;
 
@@ -178,15 +175,10 @@ static const struct imx708_mode supported_modes_10bit_no_hdr[] = {
 		},
 		.vblank_min = 58,
 		.vblank_default = 58,
-		.reg_list = {
-			.num_of_regs = ARRAY_SIZE(mode_4608x2592_regs),
-			.regs = mode_4608x2592_regs,
-		},
 		.pixel_rate = 595200000,
 		.exposure_lines_min = 8,
 		.exposure_lines_step = 1,
 		.hdr = false,
-		.remosaic = true
 	},
 	{
 		/* regular 2x2 binned. */
@@ -201,15 +193,10 @@ static const struct imx708_mode supported_modes_10bit_no_hdr[] = {
 		},
 		.vblank_min = 40,
 		.vblank_default = 1198,
-		.reg_list = {
-			.num_of_regs = ARRAY_SIZE(mode_2x2binned_regs),
-			.regs = mode_2x2binned_regs,
-		},
 		.pixel_rate = 585600000,
 		.exposure_lines_min = 4,
 		.exposure_lines_step = 2,
 		.hdr = false,
-		.remosaic = false
 	},
 	{
 		/* 2x2 binned and cropped for 720p. */
@@ -224,15 +211,10 @@ static const struct imx708_mode supported_modes_10bit_no_hdr[] = {
 		},
 		.vblank_min = 40,
 		.vblank_default = 2755,
-		.reg_list = {
-			.num_of_regs = ARRAY_SIZE(mode_2x2binned_720p_regs),
-			.regs = mode_2x2binned_720p_regs,
-		},
 		.pixel_rate = 566400000,
 		.exposure_lines_min = 4,
 		.exposure_lines_step = 2,
 		.hdr = false,
-		.remosaic = false
 	},
 };
 
@@ -250,10 +232,6 @@ static const struct imx708_mode supported_modes_10bit_hdr[] = {
 		},
 		.vblank_min = 3673,
 		.vblank_default = 3673,
-		.reg_list = {
-			.num_of_regs = ARRAY_SIZE(mode_hdr_regs),
-			.regs = mode_hdr_regs,
-		},
 		.pixel_rate = 777600000,
 		.exposure_lines_min = 8 * IMX708_HDR_EXPOSURE_RATIO * IMX708_HDR_EXPOSURE_RATIO,
 		.exposure_lines_step = 2 * IMX708_HDR_EXPOSURE_RATIO * IMX708_HDR_EXPOSURE_RATIO,
