@@ -325,9 +325,6 @@ struct imx708 {
 
 	struct v4l2_mbus_framefmt fmt;
 
-	struct clk *inclk;
-	u32 inclk_freq;
-
 	struct v4l2_ctrl_handler ctrl_handler;
 	/* V4L2 Controls */
 	struct v4l2_ctrl *pixel_rate;
@@ -353,13 +350,6 @@ struct imx708 {
 	/* Streaming on/off */
 	bool streaming;
 
-	/* Rewrite common registers on stream on? */
-	bool common_regs_written;
-
-	/* Current long exposure factor in use. Set through V4L2_CID_VBLANK */
-	unsigned int long_exp_shift;
-
-	unsigned int link_freq_idx;
 };
 
 static inline struct imx708 *to_imx708(struct v4l2_subdev *_sd)
@@ -924,13 +914,6 @@ static int imx708_power_on(struct device *dev)
 	struct imx708 *imx708 = to_imx708(sd);
 	int ret;
 
-	ret = clk_prepare_enable(imx708->inclk);
-	if (ret) {
-		dev_err(&client->dev, "%s: failed to enable clock\n",
-			__func__);
-		goto reg_off;
-	}
-
 	//usleep_range(IMX708_XCLR_MIN_DELAY_US, IMX708_XCLR_MIN_DELAY_US + IMX708_XCLR_DELAY_RANGE_US);
 
 	return 0;
@@ -1109,18 +1092,6 @@ static int imx708_probe(struct i2c_client *client)
 		return -ENOMEM;
 
 	v4l2_i2c_subdev_init(&imx708->sd, client, &imx708_subdev_ops);
-
-	/* Get system clock (inclk) */
-	imx708->inclk = devm_clk_get(dev, "inclk");
-	if (IS_ERR(imx708->inclk))
-		return dev_err_probe(dev, PTR_ERR(imx708->inclk),
-				     "failed to get inclk\n");
-
-	imx708->inclk_freq = clk_get_rate(imx708->inclk);
-	if (imx708->inclk_freq != IMX708_INCLK_FREQ)
-		return dev_err_probe(dev, -EINVAL,
-				     "inclk frequency not supported: %d Hz\n",
-				     imx708->inclk_freq);
 
 	ret = imx708_get_regulators(imx708);
 	if (ret)
