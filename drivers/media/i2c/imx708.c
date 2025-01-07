@@ -130,7 +130,7 @@ enum pad_types {
 };
 
 /* IMX708 native and active pixel array size. */
-#define IMX708_NATIVE_WIDTH		4640U
+#define IMX708_NATIVE_WIDTH		    4640U
 #define IMX708_NATIVE_HEIGHT		2658U
 #define IMX708_PIXEL_ARRAY_LEFT		16U
 #define IMX708_PIXEL_ARRAY_TOP		24U
@@ -319,17 +319,6 @@ static const u32 codes[] = {
 	MEDIA_BUS_FMT_SBGGR10_1X10,
 };
 
-/*
- * Initialisation delay between XCLR low->high and the moment when the sensor
- * can start capture (i.e. can leave software standby), given by T7 in the
- * datasheet is 8ms.  This does include I2C setup time as well.
- *
- * Note, that delay between XCLR low->high and reading the CCI ID register (T6
- * in the datasheet) is much smaller - 600us.
- */
-#define IMX708_XCLR_MIN_DELAY_US	8000
-#define IMX708_XCLR_DELAY_RANGE_US	1000
-
 struct imx708 {
 	struct v4l2_subdev sd;
 	struct media_pad pad[NUM_PADS];
@@ -338,8 +327,6 @@ struct imx708 {
 
 	struct clk *inclk;
 	u32 inclk_freq;
-
-	struct gpio_desc *reset_gpio;
 
 	struct v4l2_ctrl_handler ctrl_handler;
 	/* V4L2 Controls */
@@ -944,9 +931,7 @@ static int imx708_power_on(struct device *dev)
 		goto reg_off;
 	}
 
-	gpiod_set_value_cansleep(imx708->reset_gpio, 1);
-	usleep_range(IMX708_XCLR_MIN_DELAY_US,
-		     IMX708_XCLR_MIN_DELAY_US + IMX708_XCLR_DELAY_RANGE_US);
+	//usleep_range(IMX708_XCLR_MIN_DELAY_US, IMX708_XCLR_MIN_DELAY_US + IMX708_XCLR_DELAY_RANGE_US);
 
 	return 0;
 
@@ -1140,10 +1125,6 @@ static int imx708_probe(struct i2c_client *client)
 	ret = imx708_get_regulators(imx708);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to get regulators\n");
-
-	/* Request optional enable pin */
-	imx708->reset_gpio = devm_gpiod_get_optional(dev, "reset",
-						     GPIOD_OUT_HIGH);
 
 	/*
 	 * The sensor must be powered for imx708_identify_module()
