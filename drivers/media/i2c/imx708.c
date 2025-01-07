@@ -639,8 +639,6 @@ static int imx708_set_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 	}
 
-	pm_runtime_put(&client->dev);
-
 	return ret;
 }
 
@@ -909,12 +907,6 @@ static int imx708_set_stream(struct v4l2_subdev *sd, int enable)
 	}
 
 	if (enable) {
-		ret = pm_runtime_get_sync(&client->dev);
-		if (ret < 0) {
-			pm_runtime_put_noidle(&client->dev);
-			goto err_unlock;
-		}
-
 		/*
 		 * Apply default & customized values
 		 * and then start streaming.
@@ -924,7 +916,6 @@ static int imx708_set_stream(struct v4l2_subdev *sd, int enable)
 			goto err_rpm_put;
 	} else {
 		imx708_stop_streaming(imx708);
-		pm_runtime_put(&client->dev);
 	}
 
 	imx708->streaming = enable;
@@ -939,7 +930,6 @@ static int imx708_set_stream(struct v4l2_subdev *sd, int enable)
 	return ret;
 
 err_rpm_put:
-	pm_runtime_put(&client->dev);
 err_unlock:
 	mutex_unlock(&imx708->mutex);
 
@@ -1276,15 +1266,7 @@ static int imx708_probe(struct i2c_client *client)
 	/* Initialize default format */
 	imx708_set_default_format(imx708);
 
-	/* Enable runtime PM and turn off the device */
-	pm_runtime_set_active(dev);
-	pm_runtime_enable(dev);
-	pm_runtime_idle(dev);
-
-	/* This needs the pm runtime to be registered. */
-	ret = imx708_init_controls(imx708);
-	if (ret)
-		goto error_pm_runtime;
+	imx708_init_controls(imx708);
 
 	/* Initialize subdev */
 	imx708->sd.internal_ops = &imx708_internal_ops;
@@ -1316,10 +1298,6 @@ error_media_entity:
 error_handler_free:
 	imx708_free_controls(imx708);
 
-error_pm_runtime:
-	pm_runtime_disable(&client->dev);
-	pm_runtime_set_suspended(&client->dev);
-
 error_power_off:
 	imx708_power_off(&client->dev);
 
@@ -1335,10 +1313,6 @@ static void imx708_remove(struct i2c_client *client)
 	media_entity_cleanup(&sd->entity);
 	imx708_free_controls(imx708);
 
-	pm_runtime_disable(&client->dev);
-	if (!pm_runtime_status_suspended(&client->dev))
-		imx708_power_off(&client->dev);
-	pm_runtime_set_suspended(&client->dev);
 }
 
 static const struct of_device_id imx708_dt_ids[] = {
