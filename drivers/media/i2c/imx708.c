@@ -280,10 +280,10 @@ struct imx708 {
 	 * Mutex for serialized access:
 	 * Protect sensor module set pad format and start/stop streaming safely.
 	 */
-	struct mutex mutex;
+	struct mutex h_mutex;
 
 	/* Streaming on/off */
-	bool streaming;
+	bool bIsStreaming;
 
 };
 
@@ -322,7 +322,7 @@ static u32 imx708_get_format_code(struct imx708 *imx708)
 {
 	unsigned int i;
 
-	lockdep_assert_held(&imx708->mutex);
+	lockdep_assert_held(&imx708->h_mutex);
 
 	i = (imx708->pfn_vflip->val ? 2 : 0) |
 	    (imx708->pfn_hflip->val ? 1 : 0);
@@ -358,7 +358,7 @@ static int imx708_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 		v4l2_subdev_get_try_format(sd, fh->state, METADATA_PAD);
 	struct v4l2_rect *try_crop;
 
-	mutex_lock(&imx708->mutex);
+	mutex_lock(&imx708->h_mutex);
 
 	/* Initialize try_fmt for the image pad */
 	if (imx708->pfn_hdr_mode->val) {
@@ -384,7 +384,7 @@ static int imx708_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 	try_crop->width = IMX708_PIXEL_ARRAY_WIDTH;
 	try_crop->height = IMX708_PIXEL_ARRAY_HEIGHT;
 
-	mutex_unlock(&imx708->mutex);
+	mutex_unlock(&imx708->h_mutex);
 
 	return 0;
 }
@@ -658,7 +658,7 @@ static int imx708_get_pad_format(struct v4l2_subdev *sd,
 	if (fmt->pad >= NUM_PADS)
 		return -EINVAL;
 
-	mutex_lock(&imx708->mutex);
+	mutex_lock(&imx708->h_mutex);
 
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
 		struct v4l2_mbus_framefmt *try_fmt =
@@ -679,7 +679,7 @@ static int imx708_get_pad_format(struct v4l2_subdev *sd,
 		}
 	}
 
-	mutex_unlock(&imx708->mutex);
+	mutex_unlock(&imx708->h_mutex);
 	return 0;
 }
 
@@ -694,7 +694,7 @@ static int imx708_set_pad_format(struct v4l2_subdev *sd,
 	if (fmt->pad >= NUM_PADS)
 		return -EINVAL;
 
-	mutex_lock(&imx708->mutex);
+	mutex_lock(&imx708->h_mutex);
 
 	if (fmt->pad == IMAGE_PAD) {
 		const struct imx708_mode *mode_list;
@@ -731,7 +731,7 @@ static int imx708_set_pad_format(struct v4l2_subdev *sd,
 		}
 	}
 
-	mutex_unlock(&imx708->mutex);
+	mutex_unlock(&imx708->h_mutex);
 
 	return 0;
 }
@@ -758,10 +758,10 @@ static int imx708_get_selection(struct v4l2_subdev *sd,
 	case V4L2_SEL_TGT_CROP: {
 		struct imx708 *imx708 = to_imx708(sd);
 
-		mutex_lock(&imx708->mutex);
+		mutex_lock(&imx708->h_mutex);
 		sel->r = *__imx708_get_pad_crop(imx708, sd_state, sel->pad,
 						sel->which);
-		mutex_unlock(&imx708->mutex);
+		mutex_unlock(&imx708->h_mutex);
 
 		return 0;
 	}
@@ -812,9 +812,9 @@ static int imx708_set_stream(struct v4l2_subdev *sd, int enable)
 	struct i2c_client *client = v4l2_get_subdevdata(sd);
 	int ret = 0;
 
-	mutex_lock(&imx708->mutex);
-	if (imx708->streaming == enable) {
-		mutex_unlock(&imx708->mutex);
+	mutex_lock(&imx708->h_mutex);
+	if (imx708->bIsStreaming == enable) {
+		mutex_unlock(&imx708->h_mutex);
 		return 0;
 	}
 
@@ -828,14 +828,14 @@ static int imx708_set_stream(struct v4l2_subdev *sd, int enable)
 		imx708_stop_streaming(imx708);
 	}
 
-	imx708->streaming = enable;
+	imx708->bIsStreaming = enable;
 
 	/* vflip/hflip and hdr mode cannot change during streaming */
 	__v4l2_ctrl_grab(imx708->pfn_vflip, enable);
 	__v4l2_ctrl_grab(imx708->pfn_hflip, enable);
 	__v4l2_ctrl_grab(imx708->pfn_hdr_mode, enable);
 
-	mutex_unlock(&imx708->mutex);
+	mutex_unlock(&imx708->h_mutex);
 
 	return ret;
 
@@ -916,8 +916,8 @@ static int imx708_init_controls(struct imx708 *imx708)
 	if (ret)
 		return ret;
 
-	mutex_init(&imx708->mutex);
-	ctrl_hdlr->lock = &imx708->mutex;
+	mutex_init(&imx708->h_mutex);
+	ctrl_hdlr->lock = &imx708->h_mutex;
 
 	/* By default, PIXEL_RATE is read only */
 	imx708->pfn_pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &imx708_ctrl_ops,
@@ -1005,7 +1005,7 @@ static int imx708_init_controls(struct imx708 *imx708)
 
 error:
 	v4l2_ctrl_handler_free(ctrl_hdlr);
-	mutex_destroy(&imx708->mutex);
+	mutex_destroy(&imx708->h_mutex);
 
 	return ret;
 }
@@ -1013,7 +1013,7 @@ error:
 static void imx708_free_controls(struct imx708 *imx708)
 {
 	v4l2_ctrl_handler_free(imx708->sd.ctrl_handler);
-	mutex_destroy(&imx708->mutex);
+	mutex_destroy(&imx708->h_mutex);
 }
 
 static int imx708_probe(struct i2c_client *client)
