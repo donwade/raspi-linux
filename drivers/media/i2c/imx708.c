@@ -912,8 +912,6 @@ static int imx708_set_stream(struct v4l2_subdev *sd, int enable)
 		 * and then start streaming.
 		 */
 		ret = imx708_start_streaming(imx708);
-		if (ret)
-			goto err_rpm_put;
 	} else {
 		imx708_stop_streaming(imx708);
 	}
@@ -929,11 +927,6 @@ static int imx708_set_stream(struct v4l2_subdev *sd, int enable)
 
 	return ret;
 
-err_rpm_put:
-err_unlock:
-	mutex_unlock(&imx708->mutex);
-
-	return ret;
 }
 
 /* Power/clock management functions */
@@ -961,65 +954,10 @@ reg_off:
 	return ret;
 }
 
-static int imx708_power_off(struct device *dev)
-{
-	struct i2c_client *client = to_i2c_client(dev);
-	struct v4l2_subdev *sd = i2c_get_clientdata(client);
-	struct imx708 *imx708 = to_imx708(sd);
-
-	gpiod_set_value_cansleep(imx708->reset_gpio, 0);
-	clk_disable_unprepare(imx708->inclk);
-
-	/* Force reprogramming of the common registers when powered up again. */
-	imx708->common_regs_written = false;
-
-	return 0;
-}
-
-static int __maybe_unused imx708_suspend(struct device *dev)
-{
-	struct i2c_client *client = to_i2c_client(dev);
-	struct v4l2_subdev *sd = i2c_get_clientdata(client);
-	struct imx708 *imx708 = to_imx708(sd);
-
-	if (imx708->streaming)
-		imx708_stop_streaming(imx708);
-
-	return 0;
-}
-
-static int __maybe_unused imx708_resume(struct device *dev)
-{
-	struct i2c_client *client = to_i2c_client(dev);
-	struct v4l2_subdev *sd = i2c_get_clientdata(client);
-	struct imx708 *imx708 = to_imx708(sd);
-	int ret;
-
-	if (imx708->streaming) {
-		ret = imx708_start_streaming(imx708);
-		if (ret)
-			goto error;
-	}
-
-	return 0;
-
-error:
-	imx708_stop_streaming(imx708);
-	imx708->streaming = 0;
-	return ret;
-}
-
 static int imx708_get_regulators(struct imx708 *imx708)
 {
 	//struct i2c_client *client = v4l2_get_subdevdata(&imx708->sd);
     return 0;
-}
-
-/* Verify chip ID */
-static int imx708_identify_module(struct imx708 *imx708)
-{
-	//struct i2c_client *client = v4l2_get_subdevdata(&imx708->sd);
-	return 0;
 }
 
 static const struct v4l2_subdev_core_ops imx708_core_ops = {
@@ -1175,46 +1113,6 @@ static void imx708_free_controls(struct imx708 *imx708)
 	mutex_destroy(&imx708->mutex);
 }
 
-static int imx708_check_hwcfg(struct device *dev, struct imx708 *imx708)
-{
-	struct fwnode_handle *endpoint;
-	struct v4l2_fwnode_endpoint ep_cfg = {
-		.bus_type = V4L2_MBUS_CSI2_DPHY
-	};
-	int ret = -EINVAL;
-
-	endpoint = fwnode_graph_get_next_endpoint(dev_fwnode(dev), NULL);
-	if (!endpoint) {
-		dev_err(dev, "endpoint node not found\n");
-		return -EINVAL;
-	}
-
-	if (v4l2_fwnode_endpoint_alloc_parse(endpoint, &ep_cfg)) {
-		dev_err(dev, "could not parse endpoint\n");
-		goto error_out;
-	}
-
-	/* Check the number of MIPI CSI2 data lanes */
-	if (ep_cfg.bus.mipi_csi2.num_data_lanes != 2) {
-		dev_err(dev, "only 2 data lanes are currently supported\n");
-		goto error_out;
-	}
-
-	/* Check the link frequency set in device tree */
-	if (!ep_cfg.nr_of_link_frequencies) {
-		dev_err(dev, "link-frequency property not found in DT\n");
-		goto error_out;
-	}
-
-	ret = 0;
-
-error_out:
-	v4l2_fwnode_endpoint_free(&ep_cfg);
-	fwnode_handle_put(endpoint);
-
-	return ret;
-}
-
 static int imx708_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
@@ -1226,10 +1124,6 @@ static int imx708_probe(struct i2c_client *client)
 		return -ENOMEM;
 
 	v4l2_i2c_subdev_init(&imx708->sd, client, &imx708_subdev_ops);
-
-	/* Check the hardware configuration in device tree */
-	if (imx708_check_hwcfg(dev, imx708))
-		return -EINVAL;
 
 	/* Get system clock (inclk) */
 	imx708->inclk = devm_clk_get(dev, "inclk");
@@ -1258,10 +1152,6 @@ static int imx708_probe(struct i2c_client *client)
 	ret = imx708_power_on(dev);
 	if (ret)
 		return ret;
-
-	ret = imx708_identify_module(imx708);
-	if (ret)
-		goto error_power_off;
 
 	/* Initialize default format */
 	imx708_set_default_format(imx708);
@@ -1298,9 +1188,6 @@ error_media_entity:
 error_handler_free:
 	imx708_free_controls(imx708);
 
-error_power_off:
-	imx708_power_off(&client->dev);
-
 	return ret;
 }
 
@@ -1321,16 +1208,10 @@ static const struct of_device_id imx708_dt_ids[] = {
 };
 MODULE_DEVICE_TABLE(of, imx708_dt_ids);
 
-static const struct dev_pm_ops imx708_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(imx708_suspend, imx708_resume)
-	SET_RUNTIME_PM_OPS(imx708_power_off, imx708_power_on, NULL)
-};
-
 static struct i2c_driver imx708_i2c_driver = {
 	.driver = {
 		.name = "imx708",
 		.of_match_table	= imx708_dt_ids,
-		.pm = &imx708_pm_ops,
 	},
 	.probe = imx708_probe,
 	.remove = imx708_remove,
