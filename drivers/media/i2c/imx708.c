@@ -91,7 +91,7 @@ enum pad_types {
 
 /*
 Full HD	 1920x1080
-HD		 1280x720
+SHD		 1280x720
 
 QHD+	 3200x1800
 6K		 6144x3160
@@ -101,20 +101,27 @@ UHD/4K   3840x2160
 */
 
 /* IMX708 native and active pixel array size. */
-#define IMX708_NATIVE_WIDTH		    1920U
-#define IMX708_NATIVE_HEIGHT		1080U
-#define IMX708_PIXEL_ARRAY_LEFT		16U
-#define IMX708_PIXEL_ARRAY_TOP		24U
-#define IMX708_PIXEL_ARRAY_WIDTH	(IMX708_NATIVE_WIDTH - IMX708_PIXEL_ARRAY_LEFT)
-#define IMX708_PIXEL_ARRAY_HEIGHT	(IMX708_NATIVE_HEIGHT - IMX708_PIXEL_ARRAY_TOP)
+#define IMX708_NATIVE_WIDTH_HD		1920U
+#define IMX708_NATIVE_HEIGHT_HD		1080U
+#define IMX708_PIXEL_ARRAY_LEFT_HD	16U
+#define IMX708_PIXEL_ARRAY_TOP_HD	24U
+#define IMX708_CROP_ARRAY_WIDTH_HD	(IMX708_NATIVE_WIDTH_HD - IMX708_PIXEL_ARRAY_LEFT_HD)
+#define IMX708_CROP_ARRAY_HEIGHT_HD	(IMX708_NATIVE_HEIGHT_HD - IMX708_PIXEL_ARRAY_TOP_HD)
+
+#define IMX708_NATIVE_WIDTH_SD		1920U
+#define IMX708_NATIVE_HEIGHT_SD		1080U
+#define IMX708_PIXEL_ARRAY_LEFT_SD	16U
+#define IMX708_PIXEL_ARRAY_TOP_SD	24U
+#define IMX708_CROP_ARRAY_WIDTH_SD	(IMX708_NATIVE_WIDTH_SD - IMX708_PIXEL_ARRAY_LEFT_SD)
+#define IMX708_CROP_ARRAY_HEIGHT_SD	(IMX708_NATIVE_HEIGHT_SD - IMX708_PIXEL_ARRAY_TOP_SD)
 
 /* Mode : resolution and related config&values */
 struct imx708_mode {
 	/* Frame width */
-	unsigned int width;
+	unsigned int u_width;
 
 	/* Frame height */
-	unsigned int height;
+	unsigned int u_height;
 
 	/* H-timing in pixels */
 	unsigned int line_length_pix;
@@ -146,55 +153,35 @@ struct imx708_mode {
 /* Mode configs. Keep separate lists for when HDR is enabled or not. */
 static const struct imx708_mode supported_modes_10bit_no_hdr[] = {
 	{
-		/* Full resolution. */
-		.width = 4608,
-		.height = 2592,
-		.line_length_pix = 0x3d20,
-		.u_crop = {
-			.left = IMX708_PIXEL_ARRAY_LEFT,
-			.top = IMX708_PIXEL_ARRAY_TOP,
-			.width = 4608,
-			.height = 2592,
-		},
-		.u_max_framerate = 58,
-		.u_default_framerate = 58,
-		.u_pixel_rate = 595200000,
-		.u_minimum_exposure = 8,
-		.u_numsteps_exposure = 1,
-		.hdr = false,
-	},
-	{
-		/* regular 2x2 binned. */
-		.width = 2304,
-		.height = 1296,
+		.u_width = IMX708_NATIVE_WIDTH_HD,
+		.u_height = IMX708_NATIVE_HEIGHT_HD,
 		.line_length_pix = 0x1e90,
 		.u_crop = {
-			.left = IMX708_PIXEL_ARRAY_LEFT,
-			.top = IMX708_PIXEL_ARRAY_TOP,
-			.width = 4608,
-			.height = 2592,
+			.left = IMX708_PIXEL_ARRAY_LEFT_HD,
+			.top = IMX708_PIXEL_ARRAY_TOP_HD,
+			.width = IMX708_CROP_ARRAY_WIDTH_HD,
+			.height = IMX708_CROP_ARRAY_HEIGHT_HD,
 		},
-		.u_max_framerate = 40,
-		.u_default_framerate = 1198,
-		.u_pixel_rate = 585600000,
+		.u_max_framerate = 60,
+		.u_default_framerate = 60,
+		.u_pixel_rate = (IMX708_NATIVE_WIDTH_HD * IMX708_NATIVE_HEIGHT_HD)/2,
 		.u_minimum_exposure = 4,
 		.u_numsteps_exposure = 2,
 		.hdr = false,
 	},
 	{
-		/* 2x2 binned and cropped for 720p. */
-		.width = 1536,
-		.height = 864,
-		.line_length_pix = 0x1460,
+		.u_width = IMX708_NATIVE_WIDTH_SD,
+		.u_height = IMX708_NATIVE_HEIGHT_SD,
+		.line_length_pix = 0x1e90,
 		.u_crop = {
-			.left = IMX708_PIXEL_ARRAY_LEFT + 768,
-			.top = IMX708_PIXEL_ARRAY_TOP + 432,
-			.width = 3072,
-			.height = 1728,
+			.left = IMX708_PIXEL_ARRAY_LEFT_SD,
+			.top = IMX708_PIXEL_ARRAY_TOP_SD,
+			.width = IMX708_CROP_ARRAY_WIDTH_SD,
+			.height = IMX708_CROP_ARRAY_HEIGHT_SD,
 		},
-		.u_max_framerate = 40,
-		.u_default_framerate = 2755,
-		.u_pixel_rate = 566400000,
+		.u_max_framerate = 60,
+		.u_default_framerate = 60,
+		.u_pixel_rate = (IMX708_NATIVE_WIDTH_SD * IMX708_NATIVE_HEIGHT_SD)/2,
 		.u_minimum_exposure = 4,
 		.u_numsteps_exposure = 2,
 		.hdr = false,
@@ -303,8 +290,8 @@ static void imx708_set_default_format(struct imx708 *imx708)
 							  fmt->colorspace,
 							  fmt->ycbcr_enc);
 	fmt->xfer_func = V4L2_MAP_XFER_FUNC_DEFAULT(fmt->colorspace);
-	fmt->width = imx708->mode->width;
-	fmt->height = imx708->mode->height;
+	fmt->width = imx708->mode->u_width;
+	fmt->height = imx708->mode->u_height;
 	fmt->field = V4L2_FIELD_NONE;
 }
 
@@ -321,8 +308,8 @@ static int imx708_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 
 	/* Initialize try_fmt for the image pad */
     {
-		try_fmt_img->width = supported_modes_10bit_no_hdr[0].width;
-		try_fmt_img->height = supported_modes_10bit_no_hdr[0].height;
+		try_fmt_img->width = supported_modes_10bit_no_hdr[0].u_width;
+		try_fmt_img->height = supported_modes_10bit_no_hdr[0].u_height;
 	}
 	try_fmt_img->code = imx708_get_format_code(imx708);
 	try_fmt_img->field = V4L2_FIELD_NONE;
@@ -335,10 +322,10 @@ static int imx708_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 
 	/* Initialize try_crop */
 	try_crop = v4l2_subdev_get_try_crop(sd, fh->state, IMAGE_PAD);
-	try_crop->left = IMX708_PIXEL_ARRAY_LEFT;
-	try_crop->top = IMX708_PIXEL_ARRAY_TOP;
-	try_crop->width = IMX708_PIXEL_ARRAY_WIDTH;
-	try_crop->height = IMX708_PIXEL_ARRAY_HEIGHT;
+	try_crop->left = IMX708_PIXEL_ARRAY_LEFT_HD;
+	try_crop->top = IMX708_PIXEL_ARRAY_TOP_HD;
+	try_crop->width = IMX708_CROP_ARRAY_WIDTH_HD;
+	try_crop->height = IMX708_CROP_ARRAY_HEIGHT_HD;
 
 	mutex_unlock(&imx708->h_mutex);
 
@@ -358,7 +345,7 @@ static void imx708_adjust_exposure_range(struct imx708 *imx708,
 	int exposure_max, exposure_def;
 
 	/* Honour the VBLANK limits when setting exposure. */
-	exposure_max = imx708->mode->height + imx708->pfn_vblank->val -
+	exposure_max = imx708->mode->u_height + imx708->pfn_vblank->val -
 		IMX708_EXPOSURE_OFFSET;
 	exposure_def = min(exposure_max, imx708->pfn_exposure->val);
 	__v4l2_ctrl_modify_range(imx708->pfn_exposure, imx708->pfn_exposure->minimum,
@@ -388,7 +375,7 @@ static void imx708_set_framing_limits(struct imx708 *imx708)
 	/* Update limits and set FPS to default */
 	__v4l2_ctrl_modify_range(imx708->pfn_vblank, mode->u_max_framerate,
 				 ((1 << IMX708_LONG_EXP_SHIFT_MAX) *
-					IMX708_FRAME_LENGTH_MAX) - mode->height,
+					IMX708_FRAME_LENGTH_MAX) - mode->u_height,
 				 1, mode->u_default_framerate);
 
 	/*
@@ -396,7 +383,7 @@ static void imx708_set_framing_limits(struct imx708 *imx708)
 	 * depends on mode->width only, and is not changeable in any
 	 * way other than changing the mode.
 	 */
-	hblank = mode->line_length_pix - mode->width;
+	hblank = mode->line_length_pix - mode->u_width;
 	__v4l2_ctrl_modify_range(imx708->pfn_hblank, hblank, hblank, 1, hblank);
 }
 
@@ -429,9 +416,9 @@ static int imx708_set_ctrl(struct v4l2_ctrl *ctrl)
 			get_mode_table(code, &mode_list, &num_modes, ctrl->val);
 			imx708->mode = v4l2_find_nearest_size(mode_list,
 							      num_modes,
-							      width, height,
-							      imx708->mode->width,
-							      imx708->mode->height);
+							      u_width, u_height,
+							      imx708->mode->u_width,
+							      imx708->mode->u_height);
 			imx708_set_framing_limits(imx708);
 		}
 		break;
@@ -560,9 +547,9 @@ static int imx708_enum_frame_size(struct v4l2_subdev *sd,
 		if (fse->code != imx708_get_format_code(imx708))
 			return -EINVAL;
 
-		fse->min_width = mode_list[fse->index].width;
+		fse->min_width = mode_list[fse->index].u_width;
 		fse->max_width = fse->min_width;
-		fse->min_height = mode_list[fse->index].height;
+		fse->min_height = mode_list[fse->index].u_height;
 		fse->max_height = fse->min_height;
 	} else {
 		if (fse->code != MEDIA_BUS_FMT_SENSOR_DATA || fse->index > 0)
@@ -591,8 +578,8 @@ static void imx708_update_image_pad_format(struct imx708 *imx708,
 					   const struct imx708_mode *mode,
 					   struct v4l2_subdev_format *fmt)
 {
-	fmt->format.width = mode->width;
-	fmt->format.height = mode->height;
+	fmt->format.width = mode->u_width;
+	fmt->format.height = mode->u_height;
 	fmt->format.field = V4L2_FIELD_NONE;
 	imx708_reset_colorspace(&fmt->format);
 }
@@ -664,7 +651,7 @@ static int imx708_set_pad_format(struct v4l2_subdev *sd,
 
 		mode = v4l2_find_nearest_size(mode_list,
 					      num_modes,
-					      width, height,
+					      u_width, u_height,
 					      fmt->format.width,
 					      fmt->format.height);
 		imx708_update_image_pad_format(imx708, mode, fmt);
@@ -725,17 +712,17 @@ static int imx708_get_selection(struct v4l2_subdev *sd,
 	case V4L2_SEL_TGT_NATIVE_SIZE:
 		sel->r.left = 0;
 		sel->r.top = 0;
-		sel->r.width = IMX708_NATIVE_WIDTH;
-		sel->r.height = IMX708_NATIVE_HEIGHT;
+		sel->r.width = IMX708_NATIVE_WIDTH_HD;
+		sel->r.height = IMX708_NATIVE_HEIGHT_HD;
 
 		return 0;
 
 	case V4L2_SEL_TGT_CROP_DEFAULT:
 	case V4L2_SEL_TGT_CROP_BOUNDS:
-		sel->r.left = IMX708_PIXEL_ARRAY_LEFT;
-		sel->r.top = IMX708_PIXEL_ARRAY_TOP;
-		sel->r.width = IMX708_PIXEL_ARRAY_WIDTH;
-		sel->r.height = IMX708_PIXEL_ARRAY_HEIGHT;
+		sel->r.left = IMX708_PIXEL_ARRAY_LEFT_HD;
+		sel->r.top = IMX708_PIXEL_ARRAY_TOP_HD;
+		sel->r.width = IMX708_CROP_ARRAY_WIDTH_HD;
+		sel->r.height = IMX708_CROP_ARRAY_HEIGHT_HD;
 
 		return 0;
 	}
