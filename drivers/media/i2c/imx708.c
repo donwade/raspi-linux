@@ -406,22 +406,10 @@ static int imx708_set_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 
 	case V4L2_CID_WIDE_DYNAMIC_RANGE:
-		/*
-		 * The WIDE_DYNAMIC_RANGE control can also be applied immediately
-		 * as it doesn't set any registers. Don't do anything if the mode
-		 * already matches.
-		 */
-		if (imx708->mode && imx708->mode->hdr != ctrl->val) {
-			code = imx708_get_format_code(imx708);
-			get_mode_table(code, &mode_list, &num_modes, ctrl->val);
-			imx708->mode = v4l2_find_nearest_size(mode_list,
-							      num_modes,
-							      u_width, u_height,
-							      imx708->mode->u_width,
-							      imx708->mode->u_height);
-			imx708_set_framing_limits(imx708);
-		}
 		break;
+		dev_info(&client->dev,
+			 "ctrl V4L2_CID_WIDE_DYNAMIC_RANGE (id:0x%x,val:0x%x) is not handled\n",
+			 ctrl->id, ctrl->val);
 	}
 
 	/*
