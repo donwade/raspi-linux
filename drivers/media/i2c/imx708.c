@@ -20,14 +20,6 @@
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-mediabus.h>
 
-/*
- * Parameter to adjust Quad Bayer re-mosaic broken line correction
- * strength, used in full-resolution mode only. Set zero to disable.
- */
-static int qbc_adjust = 2;
-module_param(qbc_adjust, int, 0644);
-MODULE_PARM_DESC(qbc_adjust, "Quad Bayer broken line correction strength [0,2-5]");
-
 /* Default initial pixel rate, will get updated for each mode. */
 #define IMX708_INITIAL_PIXEL_RATE	590000000
 
@@ -68,12 +60,6 @@ MODULE_PARM_DESC(qbc_adjust, "Quad Bayer broken line correction strength [0,2-5]
 #define IMX708_TEST_PATTERN_COLOUR_MAX	0x0fff
 #define IMX708_TEST_PATTERN_COLOUR_STEP	1
 
-/* HDR exposure ratio (long:med == med:short) */
-#define IMX708_HDR_EXPOSURE_RATIO       4
-#
-/* QBC Re-mosaic broken line correction registers */
-#define IMX708_LPF_INTENSITY_EN		0xC428
-
 /*
  * Metadata buffer holds a variety of data, all sent with the same VC/DT (0x12).
  * It comprises two scanlines (of up to 5760 bytes each, for 4608 pixels)
@@ -85,7 +71,7 @@ MODULE_PARM_DESC(qbc_adjust, "Quad Bayer broken line correction strength [0,2-5]
 
 enum pad_types {
 	IMAGE_PAD,
-	METADATA_PAD,
+	EXIF_PAD,
 	IMX_NUM_PADS
 };
 
@@ -226,7 +212,7 @@ struct imx708 {
 	};
 
 	/* Current mode */
-	const struct imx708_mode *imx_mode;
+	const struct imx708_mode *imx_cam_params;
 
 	/*
 	 * Mutex for serialized access:
@@ -282,7 +268,7 @@ static void imx708_set_default_format(struct imx708 *imx708)
 	struct v4l2_mbus_framefmt *fmt = &imx708->fmt;
 
 	/* Set default mode to max resolution */
-	imx708->imx_mode = &supported_modes_10bit_no_hdr[0];
+	imx708->imx_cam_params = &supported_modes_10bit_no_hdr[0];
 
 	/* fmt->code not set as it will always be computed based on flips */
 	fmt->colorspace = V4L2_COLORSPACE_RAW;
@@ -291,35 +277,27 @@ static void imx708_set_default_format(struct imx708 *imx708)
 							  fmt->colorspace,
 							  fmt->ycbcr_enc);
 	fmt->xfer_func = V4L2_MAP_XFER_FUNC_DEFAULT(fmt->colorspace);
-	fmt->width = imx708->imx_mode->u_width;
-	fmt->height = imx708->imx_mode->u_height;
+	fmt->width = imx708->imx_cam_params->u_width;
+	fmt->height = imx708->imx_cam_params->u_height;
 	fmt->field = V4L2_FIELD_NONE;
 }
 
 static int imx708_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 {
 	struct imx708 *imx708 = to_imx708(sd);
+
 	struct v4l2_mbus_framefmt *try_fmt_img =
 		v4l2_subdev_get_try_format(sd, fh->state, IMAGE_PAD);
-	struct v4l2_mbus_framefmt *try_fmt_meta =
-		v4l2_subdev_get_try_format(sd, fh->state, METADATA_PAD);
+
 	struct v4l2_rect *try_crop;
 
 	mutex_lock(&imx708->h_mutex);
 
 	/* Initialize try_fmt for the image pad */
-    {
-		try_fmt_img->width = supported_modes_10bit_no_hdr[0].u_width;
-		try_fmt_img->height = supported_modes_10bit_no_hdr[0].u_height;
-	}
+	try_fmt_img->width = supported_modes_10bit_no_hdr[0].u_width;
+	try_fmt_img->height = supported_modes_10bit_no_hdr[0].u_height;
 	try_fmt_img->code = imx708_get_format_code(imx708);
 	try_fmt_img->field = V4L2_FIELD_NONE;
-
-	/* Initialize try_fmt for the embedded metadata pad */
-	try_fmt_meta->width = IMX708_EMBEDDED_LINE_WIDTH;
-	try_fmt_meta->height = IMX708_NUM_EMBEDDED_LINES;
-	try_fmt_meta->code = MEDIA_BUS_FMT_SENSOR_DATA;
-	try_fmt_meta->field = V4L2_FIELD_NONE;
 
 	/* Initialize try_crop */
 	try_crop = v4l2_subdev_get_try_crop(sd, fh->state, IMAGE_PAD);
@@ -332,13 +310,14 @@ static int imx708_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 
 	return 0;
 }
-
+/*
 static int imx708_set_exposure(struct imx708 *imx708, unsigned int val)
 {
-	val = max(val, imx708->imx_mode->u_minimum_exposure);
-	val -= val % imx708->imx_mode->u_numsteps_exposure;
+	val = max(val, imx708->imx_cam_params->u_minimum_exposure);
+	val -= val % imx708->imx_cam_params->u_numsteps_exposure;
     return 0;
 }
+*/
 
 static void imx708_adjust_exposure_range(struct imx708 *imx708,
 					 struct v4l2_ctrl *ctrl)
@@ -346,7 +325,7 @@ static void imx708_adjust_exposure_range(struct imx708 *imx708,
 	int exposure_max, exposure_def;
 
 	/* Honour the VBLANK limits when setting exposure. */
-	exposure_max = imx708->imx_mode->u_height + imx708->pfn_vblank_cntl->val -
+	exposure_max = imx708->imx_cam_params->u_height + imx708->pfn_vblank_cntl->val -
 		IMX708_EXPOSURE_OFFSET;
 	exposure_def = min(exposure_max, imx708->pfn_exposure_cntl->val);
 	__v4l2_ctrl_modify_range(imx708->pfn_exposure_cntl, imx708->pfn_exposure_cntl->minimum,
@@ -354,19 +333,21 @@ static void imx708_adjust_exposure_range(struct imx708 *imx708,
 				 exposure_def);
 }
 
+/*
+
 static int imx708_set_analogue_gain(struct imx708 *imx708, unsigned int val)
 {
 	return 0;
 }
-
 static int imx708_set_frame_length(struct imx708 *imx708, unsigned int val)
 {
     return 0;
 }
+*/
 
 static void imx708_set_framing_limits(struct imx708 *imx708)
 {
-	const struct imx708_mode *mode = imx708->imx_mode;
+	const struct imx708_mode *mode = imx708->imx_cam_params;
 	unsigned int hblank;
 
 	__v4l2_ctrl_modify_range(imx708->pfn_pixel_rate_cntl,
@@ -393,8 +374,6 @@ static int imx708_set_ctrl(struct v4l2_ctrl *ctrl)
 	struct imx708 *imx708 =
 		container_of(ctrl->handler, struct imx708, ctrl_handler);
 	struct i2c_client *client = v4l2_get_subdevdata(&imx708->sd);
-	const struct imx708_mode *mode_list;
-	unsigned int code, num_modes;
 	int ret = 0;
 
 	switch (ctrl->id) {
@@ -603,7 +582,7 @@ static int imx708_get_pad_format(struct v4l2_subdev *sd,
 		fmt->format = *try_fmt;
 	} else {
 		if (fmt->pad == IMAGE_PAD) {
-			imx708_update_image_pad_format(imx708, imx708->imx_mode,
+			imx708_update_image_pad_format(imx708, imx708->imx_cam_params,
 						       fmt);
 			fmt->format.code = imx708_get_format_code(imx708);
 		} else {
@@ -649,7 +628,7 @@ static int imx708_set_pad_format(struct v4l2_subdev *sd,
 							      fmt->pad);
 			*framefmt = fmt->format;
 		} else {
-			imx708->imx_mode = mode;
+			imx708->imx_cam_params = mode;
 			imx708_set_framing_limits(imx708);
 		}
 	} else {
@@ -676,7 +655,7 @@ __imx708_get_pad_crop(struct imx708 *imx708, struct v4l2_subdev_state *sd_state,
 	case V4L2_SUBDEV_FORMAT_TRY:
 		return v4l2_subdev_get_try_crop(&imx708->sd, sd_state, pad);
 	case V4L2_SUBDEV_FORMAT_ACTIVE:
-		return &imx708->imx_mode->u_crop;
+		return &imx708->imx_cam_params->u_crop;
 	}
 
 	return NULL;
@@ -740,7 +719,7 @@ static void imx708_stop_streaming(struct imx708 *imx708)
 static int imx708_set_stream(struct v4l2_subdev *sd, int enable)
 {
 	struct imx708 *imx708 = to_imx708(sd);
-	struct i2c_client *client = v4l2_get_subdevdata(sd);
+	//struct i2c_client *client = v4l2_get_subdevdata(sd);
 	int ret = 0;
 
 	mutex_lock(&imx708->h_mutex);
@@ -775,12 +754,13 @@ static int imx708_set_stream(struct v4l2_subdev *sd, int enable)
 /* Power/clock management functions */
 static int imx708_power_on(struct device *dev)
 {
+/*
 	struct i2c_client *client = to_i2c_client(dev);
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx708 *imx708 = to_imx708(sd);
 
 	//usleep_range(IMX708_XCLR_MIN_DELAY_US, IMX708_XCLR_MIN_DELAY_US + IMX708_XCLR_DELAY_RANGE_US);
-
+*/
 	return 0;
 
 }
@@ -981,7 +961,6 @@ static int imx708_probe(struct i2c_client *client)
 
 	/* Initialize source pads */
 	imx708->pad[IMAGE_PAD].flags = MEDIA_PAD_FL_SOURCE;
-	imx708->pad[METADATA_PAD].flags = MEDIA_PAD_FL_SOURCE;
 
 	ret = media_entity_pads_init(&imx708->sd.entity, IMX_NUM_PADS, imx708->pad);
 	if (ret) {
