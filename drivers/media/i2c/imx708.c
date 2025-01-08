@@ -89,23 +89,24 @@ enum pad_types {
 	NUM_PADS
 };
 
+/*
+Full HD	 1920x1080
+HD		 1280x720
+
+QHD+	 3200x1800
+6K		 6144x3160
+16K		 15360x8640	
+UHD/4K   3840x2160
+8K		 7680x4320
+*/
+
 /* IMX708 native and active pixel array size. */
-#define IMX708_NATIVE_WIDTH		    4640U
-#define IMX708_NATIVE_HEIGHT		2658U
+#define IMX708_NATIVE_WIDTH		    1920U
+#define IMX708_NATIVE_HEIGHT		1080U
 #define IMX708_PIXEL_ARRAY_LEFT		16U
 #define IMX708_PIXEL_ARRAY_TOP		24U
-#define IMX708_PIXEL_ARRAY_WIDTH	4608U
-#define IMX708_PIXEL_ARRAY_HEIGHT	2592U
-
-struct imx708_reg {
-	u16 address;
-	u8 val;
-};
-
-struct imx708_reg_list {
-	unsigned int num_of_regs;
-	const struct imx708_reg *regs;
-};
+#define IMX708_PIXEL_ARRAY_WIDTH	(IMX708_NATIVE_WIDTH - IMX708_PIXEL_ARRAY_LEFT)
+#define IMX708_PIXEL_ARRAY_HEIGHT	(IMX708_NATIVE_HEIGHT - IMX708_PIXEL_ARRAY_TOP)
 
 /* Mode : resolution and related config&values */
 struct imx708_mode {
@@ -141,22 +142,6 @@ struct imx708_mode {
 
 };
 
-/* 10-bit. */
-static const struct imx708_reg mode_4608x2592_regs[] = {
-	{0x0342, 0x3D},
-};
-
-static const struct imx708_reg mode_2x2binned_regs[] = {
-	{0x0342, 0x1E},
-};
-
-static const struct imx708_reg mode_2x2binned_720p_regs[] = {
-	{0x0342, 0x14},
-};
-
-static const struct imx708_reg mode_hdr_regs[] = {
-	{0x0342, 0x14},
-};
 
 /* Mode configs. Keep separate lists for when HDR is enabled or not. */
 static const struct imx708_mode supported_modes_10bit_no_hdr[] = {
@@ -214,27 +199,6 @@ static const struct imx708_mode supported_modes_10bit_no_hdr[] = {
 		.u_numsteps_exposure = 2,
 		.hdr = false,
 	},
-};
-
-static const struct imx708_mode supported_modes_10bit_hdr[] = {
-	{
-		/* There's only one HDR mode, which is 2x2 downscaled */
-		.width = 2304,
-		.height = 1296,
-		.line_length_pix = 0x1460,
-		.u_crop = {
-			.left = IMX708_PIXEL_ARRAY_LEFT,
-			.top = IMX708_PIXEL_ARRAY_TOP,
-			.width = 4608,
-			.height = 2592,
-		},
-		.u_max_framerate = 3673,
-		.u_default_framerate = 3673,
-		.u_pixel_rate = 777600000,
-		.u_minimum_exposure = 8 * IMX708_HDR_EXPOSURE_RATIO * IMX708_HDR_EXPOSURE_RATIO,
-		.u_numsteps_exposure = 2 * IMX708_HDR_EXPOSURE_RATIO * IMX708_HDR_EXPOSURE_RATIO,
-		.hdr = true,
-	}
 };
 
 /*
@@ -303,13 +267,8 @@ static inline void get_mode_table(unsigned int code,
 	case MEDIA_BUS_FMT_SGRBG10_1X10:
 	case MEDIA_BUS_FMT_SGBRG10_1X10:
 	case MEDIA_BUS_FMT_SBGGR10_1X10:
-		if (hdr_enable) {
-			*mode_list = supported_modes_10bit_hdr;
-			*num_modes = ARRAY_SIZE(supported_modes_10bit_hdr);
-		} else {
-			*mode_list = supported_modes_10bit_no_hdr;
-			*num_modes = ARRAY_SIZE(supported_modes_10bit_no_hdr);
-		}
+		*mode_list = supported_modes_10bit_no_hdr;
+		*num_modes = ARRAY_SIZE(supported_modes_10bit_no_hdr);
 		break;
 	default:
 		*mode_list = NULL;
@@ -361,10 +320,7 @@ static int imx708_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 	mutex_lock(&imx708->h_mutex);
 
 	/* Initialize try_fmt for the image pad */
-	if (imx708->pfn_hdr_mode->val) {
-		try_fmt_img->width = supported_modes_10bit_hdr[0].width;
-		try_fmt_img->height = supported_modes_10bit_hdr[0].height;
-	} else {
+    {
 		try_fmt_img->width = supported_modes_10bit_no_hdr[0].width;
 		try_fmt_img->height = supported_modes_10bit_no_hdr[0].height;
 	}
@@ -790,9 +746,8 @@ static int imx708_get_selection(struct v4l2_subdev *sd,
 /* Start streaming */
 static int imx708_start_streaming(struct imx708 *imx708)
 {
-	struct i2c_client *client = v4l2_get_subdevdata(&imx708->sd);
-	const struct imx708_reg_list *reg_list;
-	int ret;
+	//struct i2c_client *client = v4l2_get_subdevdata(&imx708->sd);
+    int ret;
 
 	/* Apply customized values from user */
 	ret =  __v4l2_ctrl_handler_setup(imx708->sd.ctrl_handler);
@@ -847,14 +802,11 @@ static int imx708_power_on(struct device *dev)
 	struct i2c_client *client = to_i2c_client(dev);
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx708 *imx708 = to_imx708(sd);
-	int ret;
 
 	//usleep_range(IMX708_XCLR_MIN_DELAY_US, IMX708_XCLR_MIN_DELAY_US + IMX708_XCLR_DELAY_RANGE_US);
 
 	return 0;
 
-reg_off:
-	return ret;
 }
 
 static int imx708_get_regulators(struct imx708 *imx708)
