@@ -86,7 +86,7 @@ MODULE_PARM_DESC(qbc_adjust, "Quad Bayer broken line correction strength [0,2-5]
 enum pad_types {
 	IMAGE_PAD,
 	METADATA_PAD,
-	NUM_PADS
+	IMX_NUM_PADS
 };
 
 /*
@@ -197,7 +197,8 @@ static const struct imx708_mode supported_modes_10bit_no_hdr[] = {
  * - v flip
  * - h&v flips
  */
-static const u32 codes[] = {
+
+static const u32 imx_codes[] = {
 	/* 10-bit modes. */
 	MEDIA_BUS_FMT_SRGGB10_1X10,
 	MEDIA_BUS_FMT_SGRBG10_1X10,
@@ -207,25 +208,25 @@ static const u32 codes[] = {
 
 struct imx708 {
 	struct v4l2_subdev sd;
-	struct media_pad pad[NUM_PADS];
+	struct media_pad pad[IMX_NUM_PADS];
 
 	struct v4l2_mbus_framefmt fmt;
 
 	struct v4l2_ctrl_handler ctrl_handler;
 	/* V4L2 Controls */
-	struct v4l2_ctrl *pfn_pixel_rate;
-	struct v4l2_ctrl *pfn_exposure;
-	struct v4l2_ctrl *pfn_vblank;
-	struct v4l2_ctrl *pfn_hblank;
-	struct v4l2_ctrl *pfn_hdr_mode;
-	struct v4l2_ctrl *pfn_link_freq;
+	struct v4l2_ctrl *pfn_pixel_rate_cntl;
+	struct v4l2_ctrl *pfn_exposure_cntl;
+	struct v4l2_ctrl *pfn_vblank_cntl;
+	struct v4l2_ctrl *pfn_hblank_cntl;
+	struct v4l2_ctrl *pfn_hdr_mode_cntl;
+	struct v4l2_ctrl *pfn_link_freq_cntl;
 	struct {
-		struct v4l2_ctrl *pfn_hflip;
-		struct v4l2_ctrl *pfn_vflip;
+		struct v4l2_ctrl *pfn_hflip_cntl;
+		struct v4l2_ctrl *pfn_vflip_cntl;
 	};
 
 	/* Current mode */
-	const struct imx708_mode *mode;
+	const struct imx708_mode *imx_mode;
 
 	/*
 	 * Mutex for serialized access:
@@ -270,10 +271,10 @@ static u32 imx708_get_format_code(struct imx708 *imx708)
 
 	lockdep_assert_held(&imx708->h_mutex);
 
-	i = (imx708->pfn_vflip->val ? 2 : 0) |
-	    (imx708->pfn_hflip->val ? 1 : 0);
+	i = (imx708->pfn_vflip_cntl->val ? 2 : 0) |
+	    (imx708->pfn_hflip_cntl->val ? 1 : 0);
 
-	return codes[i];
+	return imx_codes[i];
 }
 
 static void imx708_set_default_format(struct imx708 *imx708)
@@ -281,7 +282,7 @@ static void imx708_set_default_format(struct imx708 *imx708)
 	struct v4l2_mbus_framefmt *fmt = &imx708->fmt;
 
 	/* Set default mode to max resolution */
-	imx708->mode = &supported_modes_10bit_no_hdr[0];
+	imx708->imx_mode = &supported_modes_10bit_no_hdr[0];
 
 	/* fmt->code not set as it will always be computed based on flips */
 	fmt->colorspace = V4L2_COLORSPACE_RAW;
@@ -290,8 +291,8 @@ static void imx708_set_default_format(struct imx708 *imx708)
 							  fmt->colorspace,
 							  fmt->ycbcr_enc);
 	fmt->xfer_func = V4L2_MAP_XFER_FUNC_DEFAULT(fmt->colorspace);
-	fmt->width = imx708->mode->u_width;
-	fmt->height = imx708->mode->u_height;
+	fmt->width = imx708->imx_mode->u_width;
+	fmt->height = imx708->imx_mode->u_height;
 	fmt->field = V4L2_FIELD_NONE;
 }
 
@@ -334,8 +335,8 @@ static int imx708_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 
 static int imx708_set_exposure(struct imx708 *imx708, unsigned int val)
 {
-	val = max(val, imx708->mode->u_minimum_exposure);
-	val -= val % imx708->mode->u_numsteps_exposure;
+	val = max(val, imx708->imx_mode->u_minimum_exposure);
+	val -= val % imx708->imx_mode->u_numsteps_exposure;
     return 0;
 }
 
@@ -345,11 +346,11 @@ static void imx708_adjust_exposure_range(struct imx708 *imx708,
 	int exposure_max, exposure_def;
 
 	/* Honour the VBLANK limits when setting exposure. */
-	exposure_max = imx708->mode->u_height + imx708->pfn_vblank->val -
+	exposure_max = imx708->imx_mode->u_height + imx708->pfn_vblank_cntl->val -
 		IMX708_EXPOSURE_OFFSET;
-	exposure_def = min(exposure_max, imx708->pfn_exposure->val);
-	__v4l2_ctrl_modify_range(imx708->pfn_exposure, imx708->pfn_exposure->minimum,
-				 exposure_max, imx708->pfn_exposure->step,
+	exposure_def = min(exposure_max, imx708->pfn_exposure_cntl->val);
+	__v4l2_ctrl_modify_range(imx708->pfn_exposure_cntl, imx708->pfn_exposure_cntl->minimum,
+				 exposure_max, imx708->pfn_exposure_cntl->step,
 				 exposure_def);
 }
 
@@ -365,15 +366,15 @@ static int imx708_set_frame_length(struct imx708 *imx708, unsigned int val)
 
 static void imx708_set_framing_limits(struct imx708 *imx708)
 {
-	const struct imx708_mode *mode = imx708->mode;
+	const struct imx708_mode *mode = imx708->imx_mode;
 	unsigned int hblank;
 
-	__v4l2_ctrl_modify_range(imx708->pfn_pixel_rate,
+	__v4l2_ctrl_modify_range(imx708->pfn_pixel_rate_cntl,
 				 mode->u_pixel_rate, mode->u_pixel_rate,
 				 1, mode->u_pixel_rate);
 
 	/* Update limits and set FPS to default */
-	__v4l2_ctrl_modify_range(imx708->pfn_vblank, mode->u_max_framerate,
+	__v4l2_ctrl_modify_range(imx708->pfn_vblank_cntl, mode->u_max_framerate,
 				 ((1 << IMX708_LONG_EXP_SHIFT_MAX) *
 					IMX708_FRAME_LENGTH_MAX) - mode->u_height,
 				 1, mode->u_default_framerate);
@@ -384,7 +385,7 @@ static void imx708_set_framing_limits(struct imx708 *imx708)
 	 * way other than changing the mode.
 	 */
 	hblank = mode->line_length_pix - mode->u_width;
-	__v4l2_ctrl_modify_range(imx708->pfn_hblank, hblank, hblank, 1, hblank);
+	__v4l2_ctrl_modify_range(imx708->pfn_hblank_cntl, hblank, hblank, 1, hblank);
 }
 
 static int imx708_set_ctrl(struct v4l2_ctrl *ctrl)
@@ -495,11 +496,11 @@ static int imx708_enum_mbus_code(struct v4l2_subdev *sd,
 {
 	struct imx708 *imx708 = to_imx708(sd);
 
-	if (code->pad >= NUM_PADS)
+	if (code->pad >= IMX_NUM_PADS)
 		return -EINVAL;
 
 	if (code->pad == IMAGE_PAD) {
-		if (code->index >= (ARRAY_SIZE(codes) / 4))
+		if (code->index >= (ARRAY_SIZE(imx_codes) / 4))
 			return -EINVAL;
 
 		code->code = imx708_get_format_code(imx708);
@@ -519,7 +520,7 @@ static int imx708_enum_frame_size(struct v4l2_subdev *sd,
 {
 	struct imx708 *imx708 = to_imx708(sd);
 
-	if (fse->pad >= NUM_PADS)
+	if (fse->pad >= IMX_NUM_PADS)
 		return -EINVAL;
 
 	if (fse->pad == IMAGE_PAD) {
@@ -527,7 +528,7 @@ static int imx708_enum_frame_size(struct v4l2_subdev *sd,
 		unsigned int num_modes;
 
 		get_mode_table(fse->code, &mode_list, &num_modes,
-			       imx708->pfn_hdr_mode->val);
+			       imx708->pfn_hdr_mode_cntl->val);
 
 		if (fse->index >= num_modes)
 			return -EINVAL;
@@ -586,7 +587,7 @@ static int imx708_get_pad_format(struct v4l2_subdev *sd,
 {
 	struct imx708 *imx708 = to_imx708(sd);
 
-	if (fmt->pad >= NUM_PADS)
+	if (fmt->pad >= IMX_NUM_PADS)
 		return -EINVAL;
 
 	mutex_lock(&imx708->h_mutex);
@@ -602,7 +603,7 @@ static int imx708_get_pad_format(struct v4l2_subdev *sd,
 		fmt->format = *try_fmt;
 	} else {
 		if (fmt->pad == IMAGE_PAD) {
-			imx708_update_image_pad_format(imx708, imx708->mode,
+			imx708_update_image_pad_format(imx708, imx708->imx_mode,
 						       fmt);
 			fmt->format.code = imx708_get_format_code(imx708);
 		} else {
@@ -622,7 +623,7 @@ static int imx708_set_pad_format(struct v4l2_subdev *sd,
 	const struct imx708_mode *mode;
 	struct imx708 *imx708 = to_imx708(sd);
 
-	if (fmt->pad >= NUM_PADS)
+	if (fmt->pad >= IMX_NUM_PADS)
 		return -EINVAL;
 
 	mutex_lock(&imx708->h_mutex);
@@ -635,7 +636,7 @@ static int imx708_set_pad_format(struct v4l2_subdev *sd,
 		fmt->format.code = imx708_get_format_code(imx708);
 
 		get_mode_table(fmt->format.code, &mode_list, &num_modes,
-			       imx708->pfn_hdr_mode->val);
+			       imx708->pfn_hdr_mode_cntl->val);
 
 		mode = v4l2_find_nearest_size(mode_list,
 					      num_modes,
@@ -648,7 +649,7 @@ static int imx708_set_pad_format(struct v4l2_subdev *sd,
 							      fmt->pad);
 			*framefmt = fmt->format;
 		} else {
-			imx708->mode = mode;
+			imx708->imx_mode = mode;
 			imx708_set_framing_limits(imx708);
 		}
 	} else {
@@ -675,7 +676,7 @@ __imx708_get_pad_crop(struct imx708 *imx708, struct v4l2_subdev_state *sd_state,
 	case V4L2_SUBDEV_FORMAT_TRY:
 		return v4l2_subdev_get_try_crop(&imx708->sd, sd_state, pad);
 	case V4L2_SUBDEV_FORMAT_ACTIVE:
-		return &imx708->mode->u_crop;
+		return &imx708->imx_mode->u_crop;
 	}
 
 	return NULL;
@@ -761,9 +762,9 @@ static int imx708_set_stream(struct v4l2_subdev *sd, int enable)
 	imx708->bIsStreaming = enable;
 
 	/* vflip/hflip and hdr mode cannot change during streaming */
-	__v4l2_ctrl_grab(imx708->pfn_vflip, enable);
-	__v4l2_ctrl_grab(imx708->pfn_hflip, enable);
-	__v4l2_ctrl_grab(imx708->pfn_hdr_mode, enable);
+	__v4l2_ctrl_grab(imx708->pfn_vflip_cntl, enable);
+	__v4l2_ctrl_grab(imx708->pfn_hflip_cntl, enable);
+	__v4l2_ctrl_grab(imx708->pfn_hdr_mode_cntl, enable);
 
 	mutex_unlock(&imx708->h_mutex);
 
@@ -847,7 +848,7 @@ static int imx708_init_controls(struct imx708 *imx708)
 	ctrl_hdlr->lock = &imx708->h_mutex;
 
 	/* By default, PIXEL_RATE is read only */
-	imx708->pfn_pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &imx708_ctrl_ops,
+	imx708->pfn_pixel_rate_cntl = v4l2_ctrl_new_std(ctrl_hdlr, &imx708_ctrl_ops,
 					       V4L2_CID_PIXEL_RATE,
 					       IMX708_INITIAL_PIXEL_RATE,
 					       IMX708_INITIAL_PIXEL_RATE, 1,
@@ -856,12 +857,12 @@ static int imx708_init_controls(struct imx708 *imx708)
 	 * Create the controls here, but mode specific limits are setup
 	 * in the imx708_set_framing_limits() call below.
 	 */
-	imx708->pfn_vblank = v4l2_ctrl_new_std(ctrl_hdlr, &imx708_ctrl_ops,
+	imx708->pfn_vblank_cntl = v4l2_ctrl_new_std(ctrl_hdlr, &imx708_ctrl_ops,
 					   V4L2_CID_VBLANK, 0, 0xffff, 1, 0);
-	imx708->pfn_hblank = v4l2_ctrl_new_std(ctrl_hdlr, &imx708_ctrl_ops,
+	imx708->pfn_hblank_cntl = v4l2_ctrl_new_std(ctrl_hdlr, &imx708_ctrl_ops,
 					   V4L2_CID_HBLANK, 0, 0xffff, 1, 0);
 
-	imx708->pfn_exposure = v4l2_ctrl_new_std(ctrl_hdlr, &imx708_ctrl_ops,
+	imx708->pfn_exposure_cntl = v4l2_ctrl_new_std(ctrl_hdlr, &imx708_ctrl_ops,
 					     V4L2_CID_EXPOSURE,
 					     IMX708_EXPOSURE_MIN,
 					     IMX708_EXPOSURE_MAX,
@@ -876,12 +877,12 @@ static int imx708_init_controls(struct imx708 *imx708)
 			  IMX708_DGTL_GAIN_MIN, IMX708_DGTL_GAIN_MAX,
 			  IMX708_DGTL_GAIN_STEP, IMX708_DGTL_GAIN_DEFAULT);
 
-	imx708->pfn_hflip = v4l2_ctrl_new_std(ctrl_hdlr, &imx708_ctrl_ops,
+	imx708->pfn_hflip_cntl = v4l2_ctrl_new_std(ctrl_hdlr, &imx708_ctrl_ops,
 					  V4L2_CID_HFLIP, 0, 1, 1, 0);
 
-	imx708->pfn_vflip = v4l2_ctrl_new_std(ctrl_hdlr, &imx708_ctrl_ops,
+	imx708->pfn_vflip_cntl = v4l2_ctrl_new_std(ctrl_hdlr, &imx708_ctrl_ops,
 					  V4L2_CID_VFLIP, 0, 1, 1, 0);
-	v4l2_ctrl_cluster(2, &imx708->pfn_hflip);
+	v4l2_ctrl_cluster(2, &imx708->pfn_hflip_cntl);
 
 	for (i = 0; i < 4; i++) {
 		/*
@@ -901,7 +902,7 @@ static int imx708_init_controls(struct imx708 *imx708)
 
 	v4l2_ctrl_new_custom(ctrl_hdlr, &imx708_notify_gains_ctrl, NULL);
 
-	imx708->pfn_hdr_mode = v4l2_ctrl_new_std(ctrl_hdlr, &imx708_ctrl_ops,
+	imx708->pfn_hdr_mode_cntl = v4l2_ctrl_new_std(ctrl_hdlr, &imx708_ctrl_ops,
 					     V4L2_CID_WIDE_DYNAMIC_RANGE,
 					     0, 1, 1, 0);
 
@@ -918,10 +919,10 @@ static int imx708_init_controls(struct imx708 *imx708)
 		goto error;
 	}
 
-	imx708->pfn_hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
-	imx708->pfn_hflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
-	imx708->pfn_vflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
-	imx708->pfn_hdr_mode->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
+	imx708->pfn_hblank_cntl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	imx708->pfn_hflip_cntl->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
+	imx708->pfn_vflip_cntl->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
+	imx708->pfn_hdr_mode_cntl->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
 
 	imx708->sd.ctrl_handler = ctrl_hdlr;
 
@@ -982,7 +983,7 @@ static int imx708_probe(struct i2c_client *client)
 	imx708->pad[IMAGE_PAD].flags = MEDIA_PAD_FL_SOURCE;
 	imx708->pad[METADATA_PAD].flags = MEDIA_PAD_FL_SOURCE;
 
-	ret = media_entity_pads_init(&imx708->sd.entity, NUM_PADS, imx708->pad);
+	ret = media_entity_pads_init(&imx708->sd.entity, IMX_NUM_PADS, imx708->pad);
 	if (ret) {
 		dev_err(dev, "failed to init entity pads: %d\n", ret);
 		goto error_handler_free;
