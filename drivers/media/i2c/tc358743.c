@@ -495,6 +495,109 @@ static int tc358743_s_ctrl_audio_present(struct v4l2_subdev *sd)
 			audio_present(sd));
 }
 
+
+
+
+/**
+ * struct tc358743_mode - sensor mode structure
+ * @width: Frame width
+ * @height: Frame height
+ * @code: Format code
+ * @hblank: Horizontal blanking in lines
+ * @vblank: Vertical blanking in lines
+ * @vblank_min: Minimum vertical blanking in lines
+ * @vblank_max: Maximum vertical blanking in lines
+ * @pclk: Sensor pixel clock
+ * @link_freq_idx: Link frequency index
+ * @reg_list: Register list for sensor mode
+ */
+struct tc358743_mode {
+	u32 width;
+	u32 height;
+	u32 code;
+	u32 hblank;
+	u32 vblank;
+	u32 vblank_min;
+	u32 vblank_max;
+	u64 pclk;
+	u32 link_freq_idx;
+	//struct imx335_reg_list reg_list;
+};
+
+/* Supported sensor mode configurations */
+static const struct tc358743_mode supported_mode[] = {
+    {
+    	.width = 2592,
+    	.height = 1940,
+    	.hblank = 342,
+    	.vblank = 2560,
+    	.vblank_min = 2560,
+    	.vblank_max = 133060,
+    	.pclk = 396000000,
+    	.link_freq_idx = 0,
+    	.code = MEDIA_BUS_FMT_RGB888_1X24,
+    	//.reg_list = {
+    	//	.num_of_regs = ARRAY_SIZE(mode_2592x1940_regs),
+    	//	.regs = mode_2592x1940_regs,
+    	//
+    },
+    {
+    	.width = 2592,
+    	.height = 1940,
+    	.hblank = 342,
+    	.vblank = 2560,
+    	.vblank_min = 2560,
+    	.vblank_max = 133060,
+    	.pclk = 396000000,
+    	.link_freq_idx = 0,
+    	.code = MEDIA_BUS_FMT_UYVY8_1X16,
+    	//.reg_list = {
+    	//	.num_of_regs = ARRAY_SIZE(mode_2592x1940_regs),
+    	//	.regs = mode_2592x1940_regs,
+    	//
+    },
+};
+
+/**
+ * tcs358743_enum_frame_size() - Enumerate V4L2 sub-device frame sizes
+ * @sd: pointer to tcs358743 V4L2 sub-device structure
+ * @sd_state: V4L2 sub-device configuration
+ * @fsize: V4L2 sub-device size enumeration need to be filled
+ *
+ * Return: 0 if successful, error code otherwise.
+ */
+
+///////////////  NEED MORE WORK 
+static int tc358743_enum_frame_size(struct v4l2_subdev *sd,
+				  struct v4l2_subdev_state *sd_state,
+				  struct v4l2_subdev_frame_size_enum *fsize)
+{
+    int i;
+
+    int end = sizeof(supported_mode)/sizeof(supported_mode[0]);
+
+    if (fsize->index == end) return -EINVAL;
+ 
+    for (i=0; i < end; i++)
+    {
+
+	    if (fsize->code != supported_mode[i].code) continue;
+
+        v4l2_dbg(1, debug, sd, "match i=%d  fsize->code=%d vs supported_mode[i].code=%d:\n", i, fsize->code, supported_mode[i].code);
+
+	    fsize->min_width = supported_mode[i].width;
+	    fsize->max_width = fsize->min_width;
+	    fsize->min_height = supported_mode[i].height;
+	    fsize->max_height = fsize->min_height;
+        return 0;
+    }
+    
+    v4l2_dbg(1, debug, sd, "fsize->code=%d no match\n", fsize->code);
+    return -EINVAL;
+}
+
+
+
 static int tc358743_update_controls(struct v4l2_subdev *sd)
 {
 	int ret = 0;
@@ -1430,7 +1533,7 @@ static int tc358743_isr(struct v4l2_subdev *sd, u32 status, bool *handled)
 {
 	u16 intstatus = i2c_rd16(sd, INTSTATUS);
 
-	v4l2_dbg(1, debug, sd, "%s: IntStatus = 0x%04x\n", __func__, intstatus);
+	//v4l2_dbg(1, debug, sd, "%s: IntStatus = 0x%04x\n", __func__, intstatus);
 
 	if (intstatus & MASK_HDMI_INT) {
 		u8 hdmi_int0 = i2c_rd8(sd, HDMI_INT0);
@@ -1657,12 +1760,19 @@ static int tc358743_enum_mbus_code(struct v4l2_subdev *sd,
 {
 	switch (code->index) {
 	case 0:
+		v4l2_dbg(1, debug, sd, "dwade MEDIA_BUS_FMT_RGB888_1X24 returned!!!! index=%d\n", code->index);
 		code->code = MEDIA_BUS_FMT_RGB888_1X24;
 		break;
 	case 1:
+		v4l2_dbg(1, debug, sd, "dwade MEDIA_BUS_FMT_UYVY8_1X16 returned!!!! index=%d\n", code->index);
 		code->code = MEDIA_BUS_FMT_UYVY8_1X16;
 		break;
-	default:
+    case 4:
+		code->code = MEDIA_BUS_FMT_RGB888_1X24;
+		v4l2_dbg(1, debug, sd, "dwade FAKE 4 MEDIA FMT returned!!!! index=%d\n", code->index);
+        break;
+    default:
+		v4l2_dbg(1, debug, sd, "dwade I GIVE UP!!!! index=%d\n", code->index);
 		return -EINVAL;
 	}
 	return 0;
@@ -1841,6 +1951,8 @@ static const struct v4l2_subdev_pad_ops tc358743_pad_ops = {
 	.get_fmt = tc358743_get_fmt,
 	.get_edid = tc358743_g_edid,
 	.set_edid = tc358743_s_edid,
+    .enum_frame_size = tc358743_enum_frame_size,
+
 	.enum_dv_timings = tc358743_enum_dv_timings,
 	.dv_timings_cap = tc358743_dv_timings_cap,
 	.get_mbus_config = tc358743_get_mbus_config,
